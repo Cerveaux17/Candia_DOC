@@ -1,0 +1,6 @@
+{
+  "name": "Candia",
+  "description": "SaaS intelligent pour générer automatiquement des dossiers de soumission PDF ordonnés grâce à l'IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
