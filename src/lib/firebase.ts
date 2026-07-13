@@ -30,7 +30,7 @@ const app = initializeApp(firebaseConfig);
 
 // Initialize Firebase services
 export const auth = getAuth(app);
-export const db = getFirestore(app);
+export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
 
 // Provider for Google Sign-In
 export const googleProvider = new GoogleAuthProvider();

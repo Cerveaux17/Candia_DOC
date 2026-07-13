@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import dotenv from 'dotenv';
+import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
@@ -13,6 +14,18 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+// Enable CORS for frontend deployment (like Netlify)
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps, curl, or same-origin)
+    if (!origin) return callback(null, true);
+    return callback(null, origin);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
+}));
 
 // Set up JSON parsing and multipart body parsing
 app.use(express.json({ limit: '50mb' }));
@@ -2209,7 +2222,7 @@ app.post('/api/payments/create-checkout', async (req, res) => {
     console.log('[FedaPay Request URL]:', fedaPayUrl);
     console.log('[FedaPay Request Body]:', JSON.stringify(bodyData, null, 2));
 
-    const response = await fetch(fedaPayUrl, {
+    let response = await fetch(fedaPayUrl, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${secretKey}`,
@@ -2217,6 +2230,19 @@ app.post('/api/payments/create-checkout', async (req, res) => {
       },
       body: JSON.stringify(bodyData)
     });
+
+    if (response.status === 404) {
+      const fallbackUrl = `${fedaPayBaseUrl}/v1/checkouts`;
+      console.log(`[FedaPay] 404 on ${fedaPayUrl}. Retrying with fallback endpoint: ${fallbackUrl}`);
+      response = await fetch(fallbackUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${secretKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(bodyData)
+      });
+    }
 
     if (!response.ok) {
       let errorDetail = '';

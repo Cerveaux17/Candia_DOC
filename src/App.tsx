@@ -63,6 +63,34 @@ function getCategoryLabel(category: string): string {
   return map[category] || category;
 }
 
+const getApiUrl = (path: string): string => {
+  const rawBackendUrl = (import.meta as any).env?.VITE_BACKEND_URL;
+  let urlToUse = (rawBackendUrl && rawBackendUrl !== 'undefined' && rawBackendUrl !== 'null') ? rawBackendUrl : '';
+  
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname;
+    // If running in the AI Studio preview environment (Cloud Run or localhost), 
+    // we must always use the local container backend to prevent connecting to a wrong production front-end URL
+    const isCloudRun = hostname.includes('run.app') || hostname.includes('appspot.com');
+    const isLocal = hostname === 'localhost' || hostname === '127.0.0.1';
+    
+    if (isCloudRun || isLocal) {
+      urlToUse = '';
+    } else if (urlToUse) {
+      const isLocalhostUrl = urlToUse.includes('localhost') || urlToUse.includes('127.0.0.1');
+      if (isLocalhostUrl) {
+        urlToUse = '';
+      }
+    }
+  }
+  
+  if (!urlToUse) return path;
+  
+  const cleanBase = urlToUse.endsWith('/') ? urlToUse.slice(0, -1) : urlToUse;
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  return `${cleanBase}${cleanPath}`;
+};
+
 export default function App() {
   // Navigation & Tabs
   const [activeTab, setActiveTab] = useState<'safe' | 'new-application' | 'generator' | 'history' | 'admin'>('safe');
@@ -147,7 +175,7 @@ export default function App() {
     setCoverLetterError(null);
     setCoverLetterSuccess(false);
     try {
-      const res = await fetch('/api/motivation/generate', {
+      const res = await fetch(getApiUrl('/api/motivation/generate'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -178,7 +206,7 @@ export default function App() {
     setIsSavingLetter(true);
     setCoverLetterError(null);
     try {
-      const res = await fetch('/api/safe/save-text', {
+      const res = await fetch(getApiUrl('/api/safe/save-text'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -279,7 +307,7 @@ export default function App() {
 
   const fetchFedaPayStatus = async () => {
     try {
-      const res = await fetch('/api/payments/status');
+      const res = await fetch(getApiUrl('/api/payments/status'));
       if (res.ok) {
         const data = await res.json();
         setFedaPayStatus(data);
@@ -313,7 +341,7 @@ export default function App() {
   const fetchSession = async () => {
     try {
       setLoadingUser(true);
-      const res = await fetch('/api/user');
+      const res = await fetch(getApiUrl('/api/user'));
       const data = await res.json();
       if (data && data.id && data.id !== 'user_default') {
         setUser(data);
@@ -337,7 +365,7 @@ export default function App() {
 
   const fetchSessionSilent = async () => {
     try {
-      const res = await fetch('/api/user');
+      const res = await fetch(getApiUrl('/api/user'));
       const data = await res.json();
       if (data && data.id) {
         setUser(data);
@@ -350,14 +378,14 @@ export default function App() {
   const handleDownloadClick = async (e: React.MouseEvent, dossierId: string, dossierTitle: string) => {
     e.preventDefault();
     try {
-      const res = await fetch(`/api/dossiers/check-download/${dossierId}`);
+      const res = await fetch(getApiUrl(`/api/dossiers/check-download/${dossierId}`));
       const data = await res.json();
       if (data.allowed) {
         if (data.isFreeDemo) {
           alert("Félicitations ! Vous téléchargez votre premier dossier PDF de démonstration gratuitement. Profitez-en ! 🎁");
         }
         // Start download
-        window.open(`/api/dossiers/download/${dossierId}`, '_blank');
+        window.open(getApiUrl(`/api/dossiers/download/${dossierId}`), '_blank');
         // Refresh session to sync downloadedCount
         setTimeout(() => {
           fetchSessionSilent();
@@ -370,7 +398,7 @@ export default function App() {
     } catch (err) {
       console.error("Error checking download permissions:", err);
       // Fallback
-      window.open(`/api/dossiers/download/${dossierId}`, '_blank');
+      window.open(getApiUrl(`/api/dossiers/download/${dossierId}`), '_blank');
     }
   };
 
@@ -383,7 +411,7 @@ export default function App() {
       let currentStatus = fedaPayStatus;
       if (!currentStatus) {
         try {
-          const sRes = await fetch('/api/payments/status');
+          const sRes = await fetch(getApiUrl('/api/payments/status'));
           if (sRes.ok) {
             currentStatus = await sRes.json();
             setFedaPayStatus(currentStatus);
@@ -393,7 +421,7 @@ export default function App() {
         }
       }
 
-      const res = await fetch('/api/payments/create-checkout', {
+      const res = await fetch(getApiUrl('/api/payments/create-checkout'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ amountUSD: amountInUSD, description, isSubscription, dossierId })
@@ -457,7 +485,7 @@ export default function App() {
   const completePayment = async (isSubscription: boolean, dossierId?: string, transactionId?: string) => {
     try {
       if (isSubscription) {
-        const res = await fetch('/api/user/upgrade-to-paid', {
+        const res = await fetch(getApiUrl('/api/user/upgrade-to-paid'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ transactionId })
@@ -470,7 +498,7 @@ export default function App() {
           setShowFedaPayModal(false);
         }
       } else if (dossierId) {
-        const res = await fetch('/api/dossiers/unlock', {
+        const res = await fetch(getApiUrl('/api/dossiers/unlock'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ dossierId, transactionId })
@@ -481,7 +509,7 @@ export default function App() {
           setSuccessMsg('Dossier déverrouillé avec succès ! Téléchargement en cours... 📄');
           setShowFedaPayModal(false);
           // Trigger download immediately
-          window.open(`/api/dossiers/download/${dossierId}`, '_blank');
+          window.open(getApiUrl(`/api/dossiers/download/${dossierId}`), '_blank');
         }
       }
       await fetchHistory();
@@ -529,7 +557,7 @@ export default function App() {
   const fetchSafeDocs = async () => {
     try {
       setLoadingSafe(true);
-      const res = await fetch('/api/safe');
+      const res = await fetch(getApiUrl('/api/safe'));
       const data = await res.json();
       setSafeDocs(data);
     } catch (err) {
@@ -542,7 +570,7 @@ export default function App() {
   const fetchHistory = async () => {
     try {
       setLoadingHistory(true);
-      const res = await fetch('/api/dossiers');
+      const res = await fetch(getApiUrl('/api/dossiers'));
       const data = await res.json();
       setHistory(data);
     } catch (err) {
@@ -564,7 +592,7 @@ export default function App() {
       }
 
       // Sync user to server
-      const res = await fetch('/api/auth/firebase-sync', {
+      const res = await fetch(getApiUrl('/api/auth/firebase-sync'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -586,7 +614,11 @@ export default function App() {
       await Promise.all([fetchSafeDocs(), fetchHistory()]);
     } catch (err: any) {
       console.error('Google Sign In Error:', err);
-      showError(err.message || 'Une erreur est survenue lors de la connexion Google.');
+      if (err.code === 'auth/popup-closed-by-user' || (err.message && err.message.includes('popup-closed-by-user'))) {
+        showError("La fenêtre de connexion Google a été fermée. Veuillez réessayer.");
+      } else {
+        showError(err.message || 'Une erreur est survenue lors de la connexion Google.');
+      }
     }
   };
 
@@ -598,7 +630,7 @@ export default function App() {
       const userCredential = await signInWithEmailAndPassword(auth, authForm.email, authForm.password);
       const fUser = userCredential.user;
       
-      const res = await fetch('/api/auth/firebase-sync', {
+      const res = await fetch(getApiUrl('/api/auth/firebase-sync'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -618,7 +650,7 @@ export default function App() {
     } catch (err: any) {
       console.warn('Firebase login failed, attempting local DB fallback:', err);
       try {
-        const res = await fetch('/api/auth/login', {
+        const res = await fetch(getApiUrl('/api/auth/login'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: authForm.email, password: authForm.password })
@@ -646,7 +678,7 @@ export default function App() {
       const userCredential = await createUserWithEmailAndPassword(auth, authForm.email, authForm.password);
       const fUser = userCredential.user;
 
-      const res = await fetch('/api/auth/firebase-sync', {
+      const res = await fetch(getApiUrl('/api/auth/firebase-sync'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -668,7 +700,7 @@ export default function App() {
     } catch (err: any) {
       console.warn('Firebase signup failed, trying local DB signup:', err);
       try {
-        const res = await fetch('/api/auth/signup', {
+        const res = await fetch(getApiUrl('/api/auth/signup'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(authForm)
@@ -696,7 +728,7 @@ export default function App() {
       } catch (e) {
         console.warn('Firebase signout skipped or failed:', e);
       }
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch(getApiUrl('/api/auth/logout'), { method: 'POST' });
       setIsLoggedIn(false);
       setUser(null);
       setSafeDocs([]);
@@ -721,7 +753,7 @@ export default function App() {
     } catch (err: any) {
       console.warn('Firebase forgot-password failed, trying local DB reset link generation:', err);
       try {
-        const res = await fetch('/api/auth/forgot-password', {
+        const res = await fetch(getApiUrl('/api/auth/forgot-password'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: authForm.email })
@@ -739,7 +771,7 @@ export default function App() {
 
   const verifyEmailSimulated = async () => {
     try {
-      const res = await fetch('/api/auth/verify-email', { method: 'POST' });
+      const res = await fetch(getApiUrl('/api/auth/verify-email'), { method: 'POST' });
       const data = await res.json();
       if (res.ok) {
         setUser(data.user);
@@ -753,7 +785,7 @@ export default function App() {
   const handlePlanChange = async (targetPlan: 'free' | 'essentiel' | 'pro' | 'business') => {
     if (targetPlan === 'free') {
       try {
-        const res = await fetch('/api/user/change-plan', {
+        const res = await fetch(getApiUrl('/api/user/change-plan'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ plan: 'free' })
@@ -793,7 +825,7 @@ export default function App() {
     formData.append('category', category);
 
     try {
-      const res = await fetch('/api/safe/upload', {
+      const res = await fetch(getApiUrl('/api/safe/upload'), {
         method: 'POST',
         body: formData,
       });
@@ -847,7 +879,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch(`/api/safe/${id}`, { method: 'DELETE' });
+      const res = await fetch(getApiUrl(`/api/safe/${id}`), { method: 'DELETE' });
       if (!res.ok) throw new Error('Échec de la suppression');
       await fetchSafeDocs();
       showSuccess('Document retiré de votre coffre-fort.');
@@ -878,7 +910,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('/api/offers/analyze', {
+      const res = await fetch(getApiUrl('/api/offers/analyze'), {
         method: 'POST',
         body: formData,
       });
@@ -962,7 +994,7 @@ export default function App() {
     };
 
     try {
-      const res = await fetch('/api/dossiers/generate', {
+      const res = await fetch(getApiUrl('/api/dossiers/generate'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -992,9 +1024,9 @@ export default function App() {
     setLoadingAdmin(true);
     try {
       const [statsRes, usersRes, logsRes] = await Promise.all([
-        fetch('/api/admin/stats'),
-        fetch(`/api/admin/users?search=${encodeURIComponent(adminSearch)}&plan=${adminFilterPlan}&country=${adminFilterCountry}`),
-        fetch('/api/admin/logs')
+        fetch(getApiUrl('/api/admin/stats')),
+        fetch(getApiUrl(`/api/admin/users?search=${encodeURIComponent(adminSearch)}&plan=${adminFilterPlan}&country=${adminFilterCountry}`)),
+        fetch(getApiUrl('/api/admin/logs'))
       ]);
 
       const statsData = await statsRes.json();
@@ -1020,7 +1052,7 @@ export default function App() {
   // Admin Toggle Suspend Action
   const toggleUserSuspension = async (userId: string) => {
     try {
-      const res = await fetch(`/api/admin/users/${userId}/suspend`, { method: 'POST' });
+      const res = await fetch(getApiUrl(`/api/admin/users/${userId}/suspend`), { method: 'POST' });
       if (res.ok) {
         showSuccess('Statut d\'accès de l\'utilisateur modifié !');
         loadAdminDashboard();
@@ -1033,7 +1065,7 @@ export default function App() {
   // Admin Change Plan Action
   const adminChangeUserPlan = async (userId: string, targetPlan: string) => {
     try {
-      const res = await fetch(`/api/admin/users/${userId}/change-plan`, {
+      const res = await fetch(getApiUrl(`/api/admin/users/${userId}/change-plan`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plan: targetPlan })
@@ -1440,7 +1472,7 @@ export default function App() {
                               onClick={async () => {
                                 // Fast simulated login as default candidate
                                 setAuthForm({ name: 'Candidat Démo', email: 'candidat.demo@candia.ai', password: 'password123', country: 'Sénégal' });
-                                const res = await fetch('/api/auth/login', {
+                                const res = await fetch(getApiUrl('/api/auth/login'), {
                                   method: 'POST',
                                   headers: { 'Content-Type': 'application/json' },
                                   body: JSON.stringify({ email: 'candidat.demo@candia.ai', password: 'password123' })
@@ -1464,7 +1496,7 @@ export default function App() {
                               onClick={async () => {
                                 // Fast simulated login as admin
                                 setAuthForm({ name: 'Administrateur Principal', email: 'admin@candia.ai', password: 'AdminPassword2026!', country: 'Sénégal' });
-                                const res = await fetch('/api/auth/login', {
+                                const res = await fetch(getApiUrl('/api/auth/login'), {
                                   method: 'POST',
                                   headers: { 'Content-Type': 'application/json' },
                                   body: JSON.stringify({ email: 'admin@candia.ai', password: 'AdminPassword2026!' })
@@ -1621,7 +1653,7 @@ export default function App() {
                               onClick={() => {
                                 const newPass = window.prompt("Saisissez votre nouveau mot de passe :");
                                 if (newPass) {
-                                  fetch('/api/auth/reset-password', {
+                                  fetch(getApiUrl('/api/auth/reset-password'), {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({ email: authForm.email, newPassword: newPass })
@@ -2776,8 +2808,8 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {adminUsers.map((u) => (
-                          <tr key={u.id} className="hover:bg-slate-50/40">
+                        {adminUsers.map((u, index) => (
+                          <tr key={`${u.id || 'u'}-${index}`} className="hover:bg-slate-50/40">
                             <td className="py-3.5 px-4">
                               <span className="font-bold text-slate-900 block">{u.name}</span>
                               <span className="text-[10px] text-slate-400">{u.email}</span>
@@ -2826,8 +2858,8 @@ export default function App() {
                   <h4 className="font-display font-bold text-slate-900 text-base pb-3 border-b border-slate-100">Journal d'Audit d'Activité (SaaS)</h4>
                   
                   <div className="mt-4 space-y-3 max-h-80 overflow-y-auto">
-                    {adminLogs.map((log) => (
-                      <div key={log.id} className="flex justify-between items-start text-xs border-b border-slate-50 pb-2.5">
+                    {adminLogs.map((log, index) => (
+                      <div key={`${log.id || 'log'}-${index}`} className="flex justify-between items-start text-xs border-b border-slate-50 pb-2.5">
                         <div className="space-y-0.5">
                           <span className={`inline-block text-[8px] font-bold px-1.5 py-0.5 rounded mr-2 uppercase ${log.action === 'GENERATE' ? 'bg-emerald-100 text-emerald-800' : log.action === 'ANALYZE' ? 'bg-indigo-100 text-indigo-800' : 'bg-slate-100 text-slate-600'}`}>
                             {log.action}

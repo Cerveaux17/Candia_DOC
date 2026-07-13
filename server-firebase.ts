@@ -1,14 +1,5 @@
-import { initializeApp } from 'firebase/app';
-import { 
-  getFirestore, 
-  doc, 
-  getDoc, 
-  setDoc, 
-  collection, 
-  getDocs, 
-  writeBatch,
-  deleteDoc
-} from 'firebase/firestore';
+import { getApps, initializeApp } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 import fs from 'fs';
 import path from 'path';
 
@@ -19,7 +10,7 @@ let firebaseConfig: any = null;
 try {
   if (fs.existsSync(configPath)) {
     firebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    console.log('🔥 Server-side Firebase config loaded successfully.');
+    console.log('🔥 Server-side Firebase admin config loaded successfully.');
   } else {
     console.warn('⚠️ firebase-applet-config.json not found on server.');
   }
@@ -31,11 +22,24 @@ let db: any = null;
 
 if (firebaseConfig) {
   try {
-    const app = initializeApp(firebaseConfig);
-    db = getFirestore(app);
-    console.log('🔥 Firebase initialized successfully on server-side.');
+    let app;
+    const apps = getApps();
+    if (apps.length === 0) {
+      app = initializeApp({
+        projectId: firebaseConfig.projectId,
+      });
+    } else {
+      app = apps[0]!;
+    }
+    
+    if (firebaseConfig.firestoreDatabaseId) {
+      db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+    } else {
+      db = getFirestore(app);
+    }
+    console.log('🔥 Firebase Admin initialized successfully on server-side.');
   } catch (e) {
-    console.error('❌ Failed to initialize Firebase on server-side:', e);
+    console.error('❌ Failed to initialize Firebase Admin on server-side:', e);
   }
 }
 
@@ -64,8 +68,8 @@ export async function syncFromFirestore(defaultDb: any): Promise<any> {
 
     for (const colName of collections) {
       try {
-        const querySnapshot = await getDocs(collection(db, colName));
-        querySnapshot.forEach((docSnap) => {
+        const querySnapshot = await db.collection(colName).get();
+        querySnapshot.forEach((docSnap: any) => {
           loadedData[colName].push({
             id: docSnap.id,
             ...docSnap.data()
@@ -103,14 +107,14 @@ async function seedFirestore(defaultDb: any) {
       console.log(`Seed collection: ${colName} with ${items.length} items.`);
       
       // Batch write to avoid individual requests
-      const batch = writeBatch(db);
+      const batch = db.batch();
       let batchCount = 0;
 
       for (const item of items) {
         if (!item.id) continue;
         const itemCopy = { ...item };
         delete itemCopy.id; // Store id as document ID, not field if redundant (or keep it)
-        const docRef = doc(db, colName, item.id);
+        const docRef = db.collection(colName).doc(item.id);
         batch.set(docRef, itemCopy);
         batchCount++;
 
@@ -140,7 +144,7 @@ export async function saveEntityToFirestore(collectionName: string, id: string, 
     if (dataCopy.id) {
       delete dataCopy.id;
     }
-    await setDoc(doc(db, collectionName, id), dataCopy, { merge: true });
+    await db.collection(collectionName).doc(id).set(dataCopy, { merge: true });
   } catch (error) {
     console.error(`❌ Error saving ${collectionName}/${id} to Firestore:`, error);
   }
@@ -152,7 +156,7 @@ export async function saveEntityToFirestore(collectionName: string, id: string, 
 export async function deleteEntityFromFirestore(collectionName: string, id: string) {
   if (!db) return;
   try {
-    await deleteDoc(doc(db, collectionName, id));
+    await db.collection(collectionName).doc(id).delete();
   } catch (error) {
     console.error(`❌ Error deleting ${collectionName}/${id} from Firestore:`, error);
   }
