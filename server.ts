@@ -72,7 +72,7 @@ interface ActivityLog {
   id: string;
   userId: string;
   userEmail: string;
-  action: 'SIGNUP' | 'LOGIN' | 'ANALYZE' | 'GENERATE' | 'LETTER_GEN' | 'EMAIL_VERIFY';
+  action: 'SIGNUP' | 'LOGIN' | 'ANALYZE' | 'GENERATE' | 'LETTER_GEN' | 'EMAIL_VERIFY' | 'UPGRADE';
   timestamp: string;
   details: string;
   country: string;
@@ -91,6 +91,8 @@ interface LocalDB {
     emailVerified: boolean;
     createdAt: string;
     role?: 'admin' | 'user';
+    unlockedDossiers?: string[];
+    downloadedDossiers?: string[];
   };
   users: {
     id: string;
@@ -105,6 +107,8 @@ interface LocalDB {
     emailVerified: boolean;
     lastActiveAt: string;
     role?: 'admin' | 'user';
+    unlockedDossiers?: string[];
+    downloadedDossiers?: string[];
   }[];
   documents: {
     id: string;
@@ -415,11 +419,23 @@ function getDB(): LocalDB {
         if (!u.role) {
           u.role = (u.email.toLowerCase() === 'admin@candia.ai') ? 'admin' : 'user';
         }
+        if (!u.unlockedDossiers) {
+          u.unlockedDossiers = [];
+        }
+        if (!u.downloadedDossiers) {
+          u.downloadedDossiers = [];
+        }
       });
 
       if (parsed.user) {
         if (!parsed.user.role) {
           parsed.user.role = (parsed.user.email.toLowerCase() === 'admin@candia.ai') ? 'admin' : 'user';
+        }
+        if (!parsed.user.unlockedDossiers) {
+          parsed.user.unlockedDossiers = [];
+        }
+        if (!parsed.user.downloadedDossiers) {
+          parsed.user.downloadedDossiers = [];
         }
       }
 
@@ -1289,17 +1305,8 @@ app.post('/api/dossiers/generate', async (req, res) => {
 
     const db = getDB();
 
-    // Check plan limits
+    // Check plan limits - allowed freely now, payment is at download
     const currentPlan = db.user.plan;
-    if (currentPlan === 'free') {
-      const isPaidUnit = req.body.isPaidUnit; // user opted for unit pay of 2000 FCFA
-      if (db.user.monthlyDossiersCreated >= 3 && !isPaidUnit) {
-        return res.status(403).json({
-          error: 'Limite de génération atteinte pour le plan gratuit (3 dossiers par mois). Veuillez activer l\'offre PRO pour un usage illimité ou régler un paiement à l\'unité de 2 000 FCFA pour ce dossier.',
-          showPaymentOption: true,
-        });
-      }
-    }
 
     const offer = db.offers.find((off) => off.id === offerId);
     if (!offer) {
@@ -1856,12 +1863,473 @@ app.get('/api/dossiers', (req, res) => {
   res.json(db.dossiers);
 });
 
-app.get('/api/dossiers/download/:id', (req, res) => {
+// Check download permissions for a dossier
+app.get('/api/dossiers/check-download/:id', (req, res) => {
   const db = getDB();
-  const dossier = db.dossiers.find((d) => d.id === req.params.id);
+  const dossierId = req.params.id;
+  const dossier = db.dossiers.find((d) => d.id === dossierId);
 
   if (!dossier) {
     return res.status(404).json({ error: 'Dossier introuvable' });
+  }
+
+  const user = db.user;
+  
+  // Admin is always allowed
+  if (user && user.role === 'admin') {
+    return res.json({ allowed: true });
+  }
+
+  // Paid plans (pro, business, essentiel) are always allowed
+  const hasPaidPlan = ['essentiel', 'pro', 'business'].includes(user?.plan || 'free');
+  if (hasPaidPlan) {
+    return res.json({ allowed: true });
+  }
+
+  // Check if specifically unlocked/paid
+  const unlocked = user?.unlockedDossiers?.includes(dossierId);
+  if (unlocked) {
+    return res.json({ allowed: true });
+  }
+
+  // Check if free demo download is still available (exactly 1 free PDF demo download)
+  const downloadedCount = user?.downloadedDossiers?.length || 0;
+  if (downloadedCount === 0) {
+    return res.json({ allowed: true, isFreeDemo: true });
+  }
+
+  return res.json({ allowed: false, reason: 'payment_required' });
+});
+
+// Unlock a single dossier manually or after individual payment (2.5 USD)
+app.post('/api/dossiers/unlock', (req, res) => {
+  const { dossierId, transactionId } = req.body;
+  if (!dossierId) {
+    return res.status(400).json({ error: 'Dossier ID manquant' });
+  }
+
+  const db = getDB();
+  const user = db.user;
+  if (!user) {
+    return res.status(401).json({ error: 'Non connecté' });
+  }
+
+  if (!user.unlockedDossiers) {
+    user.unlockedDossiers = [];
+  }
+  
+  if (!user.unlockedDossiers.includes(dossierId)) {
+    user.unlockedDossiers.push(dossierId);
+  }
+
+  const foundUser = db.users.find(u => u.id === user.id);
+  if (foundUser) {
+    if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+    if (!foundUser.unlockedDossiers.includes(dossierId)) {
+      foundUser.unlockedDossiers.push(dossierId);
+    }
+  }
+
+  logActivity(
+    user.id,
+    user.email,
+    'UPGRADE',
+    `Déverrouillage individuel du dossier ${dossierId} via FedaPay (2.5 USD) - Trans ID: ${transactionId || 'N/A'}`,
+    user.country || 'Sénégal',
+    2.5
+  );
+
+  saveDB(db);
+  res.json({ success: true, user });
+});
+
+// Record when user has consumed their 1 free demo download
+app.post('/api/user/record-free-download', (req, res) => {
+  const { dossierId } = req.body;
+  if (!dossierId) {
+    return res.status(400).json({ error: 'Dossier ID manquant' });
+  }
+
+  const db = getDB();
+  const user = db.user;
+  if (!user) {
+    return res.status(401).json({ error: 'Non connecté' });
+  }
+
+  if (!user.downloadedDossiers) {
+    user.downloadedDossiers = [];
+  }
+
+  if (!user.downloadedDossiers.includes(dossierId)) {
+    user.downloadedDossiers.push(dossierId);
+  }
+
+  const foundUser = db.users.find(u => u.id === user.id);
+  if (foundUser) {
+    if (!foundUser.downloadedDossiers) foundUser.downloadedDossiers = [];
+    if (!foundUser.downloadedDossiers.includes(dossierId)) {
+      foundUser.downloadedDossiers.push(dossierId);
+    }
+  }
+
+  logActivity(
+    user.id,
+    user.email,
+    'GENERATE',
+    `Téléchargement du dossier de démonstration gratuit : ${dossierId}`,
+    user.country || 'Sénégal',
+    0
+  );
+
+  saveDB(db);
+  res.json({ success: true, user });
+});
+
+// Upgrade user to monthly subscription (5 USD) or pro plan
+app.post('/api/user/upgrade-to-paid', (req, res) => {
+  const { transactionId } = req.body;
+  const db = getDB();
+  const user = db.user;
+  if (!user) {
+    return res.status(401).json({ error: 'Non connecté' });
+  }
+
+  // Update to Pro plan
+  user.plan = 'pro';
+
+  const foundUser = db.users.find(u => u.id === user.id);
+  if (foundUser) {
+    foundUser.plan = 'pro';
+  }
+
+  logActivity(
+    user.id,
+    user.email,
+    'UPGRADE',
+    `Activation de la formule Mensuelle Pro via FedaPay (5 USD) - Trans ID: ${transactionId || 'N/A'}`,
+    user.country || 'Sénégal',
+    5.0
+  );
+
+  saveDB(db);
+  res.json({ success: true, user });
+});
+
+// Create FedaPay checkout session via API
+app.post('/api/payments/create-checkout', async (req, res) => {
+  try {
+    const { amountUSD, description, isSubscription, dossierId } = req.body;
+    const db = getDB();
+    const user = db.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Non connecté' });
+    }
+
+    const secretKey = (process.env.FEDAPAY_SECRET_KEY || '').replace(/^["']|["']$/g, '').trim() || 'sk_sandbox_demo';
+    
+    // Convert USD to CFA (1 USD = 600 CFA)
+    const amountCFA = Math.round((amountUSD || 2.5) * 600);
+    const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+
+    // Mode simulation if secret key is demo
+    if (secretKey === 'sk_sandbox_demo' || secretKey.includes('demo')) {
+      console.log('[FedaPay SIMULATION] key is demo, generating simulated checkout URL');
+      const mockUrl = `${appUrl}/api/payments/callback?id=mock_txn_${Date.now()}&status=approved&dossierId=${dossierId || ''}&isSubscription=${isSubscription ? 'true' : 'false'}&userId=${user.id}`;
+      return res.json({ url: mockUrl, simulated: true });
+    }
+
+    // Create a Checkout Session on FedaPay (Use sandbox-api.fedapay.com for sandbox and api.fedapay.com for live keys)
+    const isLive = secretKey.startsWith('sk_live_') || secretKey.startsWith('pk_live_');
+    const fedaPayBaseUrl = isLive ? 'https://api.fedapay.com' : 'https://sandbox-api.fedapay.com';
+    const fedaPayUrl = `${fedaPayBaseUrl}/v1/checkout_links`;
+
+    const firstname = user.name ? user.name.split(' ')[0] : 'Candidat';
+    const lastname = user.name ? user.name.split(' ').slice(1).join(' ') || 'Candia' : 'Candia';
+
+    const bodyData = {
+      published: true,
+      transaction: {
+        amount: amountCFA,
+        currency: {
+          iso: 'XOF'
+        },
+        description: description || 'Paiement Candia',
+        customer: {
+          firstname: firstname,
+          lastname: lastname,
+          email: user.email
+        }
+      },
+      callback_url: `${appUrl}/api/payments/callback?dossierId=${dossierId || ''}&isSubscription=${isSubscription ? 'true' : 'false'}&userId=${user.id}`
+    };
+
+    console.log('[FedaPay Request URL]:', fedaPayUrl);
+    console.log('[FedaPay Request Body]:', JSON.stringify(bodyData, null, 2));
+
+    const response = await fetch(fedaPayUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${secretKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(bodyData)
+    });
+
+    if (!response.ok) {
+      let errorDetail = '';
+      try {
+        const errorJson = await response.clone().json();
+        console.error('FedaPay API Error JSON:', JSON.stringify(errorJson, null, 2));
+        errorDetail = errorJson.message || errorJson.error || JSON.stringify(errorJson);
+      } catch (e) {
+        errorDetail = await response.text();
+        console.error('FedaPay API Error Raw Text:', errorDetail);
+      }
+      return res.status(response.status).json({ error: `Erreur FedaPay (${response.status}) : ${errorDetail}` });
+    }
+
+    const data = await response.json();
+    const checkoutUrl = data?.checkout_link?.url || data?.checkout?.url || data?.['v1/checkout']?.url || data?.url;
+
+    if (!checkoutUrl) {
+      console.error('No checkout URL in FedaPay response:', data);
+      return res.status(500).json({ error: 'L\'URL de paiement n\'a pas pu être générée par FedaPay.' });
+    }
+
+    res.json({ url: checkoutUrl });
+  } catch (error: any) {
+    console.error('Error creating checkout:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get FedaPay configuration status
+app.get('/api/payments/status', (req, res) => {
+  try {
+    const secretKey = (process.env.FEDAPAY_SECRET_KEY || '').replace(/^["']|["']$/g, '').trim();
+    const publicKey = (process.env.VITE_FEDAPAY_PUBLIC_KEY || '').replace(/^["']|["']$/g, '').trim();
+    
+    const hasSecret = !!secretKey && secretKey !== 'sk_sandbox_demo' && !secretKey.includes('demo');
+    const hasPublic = !!publicKey;
+    const isLive = secretKey.startsWith('sk_live_') || publicKey.startsWith('pk_live_');
+    
+    res.json({
+      configured: hasSecret,
+      isLive,
+      mode: isLive ? 'live' : (hasSecret ? 'sandbox_real' : 'simulation_local'),
+      publicKeyPrefix: publicKey ? publicKey.substring(0, 10) + '...' : null,
+      secretKeyPrefix: secretKey ? secretKey.substring(0, 10) + '...' : null
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// FedaPay payment completion callback
+app.get('/api/payments/callback', async (req, res) => {
+  try {
+    const { id, dossierId, isSubscription, userId } = req.query;
+    
+    if (!id) {
+      return res.redirect('/?payment_status=failed&message=' + encodeURIComponent('ID de transaction manquant.'));
+    }
+
+    const transactionId = id as string;
+
+    // Simulation check
+    if (transactionId.startsWith('mock_txn_')) {
+      const db = getDB();
+      const targetUserId = userId as string;
+      
+      if (isSubscription === 'true') {
+        if (db.user && db.user.id === targetUserId) {
+          db.user.plan = 'pro';
+        }
+        const foundUser = db.users.find(u => u.id === targetUserId);
+        if (foundUser) {
+          foundUser.plan = 'pro';
+        }
+        
+        logActivity(
+          targetUserId,
+          db.user?.email || 'user@example.com',
+          'UPGRADE',
+          `[SIMULATION] Activation de la formule Mensuelle Pro via FedaPay API - Trans ID: ${transactionId}`,
+          db.user?.country || 'Sénégal',
+          5.0
+        );
+      } else if (dossierId) {
+        const targetDossierId = dossierId as string;
+        
+        if (db.user && db.user.id === targetUserId) {
+          if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+          if (!db.user.unlockedDossiers.includes(targetDossierId)) {
+            db.user.unlockedDossiers.push(targetDossierId);
+          }
+        }
+        
+        const foundUser = db.users.find(u => u.id === targetUserId);
+        if (foundUser) {
+          if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+          if (!foundUser.unlockedDossiers.includes(targetDossierId)) {
+            foundUser.unlockedDossiers.push(targetDossierId);
+          }
+        }
+
+        logActivity(
+          targetUserId,
+          db.user?.email || 'user@example.com',
+          'UPGRADE',
+          `[SIMULATION] Déverrouillage individuel du dossier ${targetDossierId} via FedaPay API - Trans ID: ${transactionId}`,
+          db.user?.country || 'Sénégal',
+          2.5
+        );
+      }
+      
+      saveDB(db);
+      return res.redirect('/?payment_status=success&message=' + encodeURIComponent('Paiement de démonstration validé avec succès !'));
+    }
+
+    const secretKey = (process.env.FEDAPAY_SECRET_KEY || '').replace(/^["']|["']$/g, '').trim() || 'sk_sandbox_demo';
+    
+    // Retrieve and verify transaction status from FedaPay (Use sandbox-api.fedapay.com for sandbox and api.fedapay.com for live keys)
+    const isLive = secretKey.startsWith('sk_live_') || secretKey.startsWith('pk_live_');
+    const fedaPayBaseUrl = isLive ? 'https://api.fedapay.com' : 'https://sandbox-api.fedapay.com';
+    const verifyUrl = `${fedaPayBaseUrl}/v1/transactions/${transactionId}`;
+    const response = await fetch(verifyUrl, {
+      headers: {
+        'Authorization': `Bearer ${secretKey}`
+      }
+    });
+
+    if (!response.ok) {
+      console.error('Failed to verify FedaPay transaction:', transactionId);
+      return res.redirect('/?payment_status=failed&message=' + encodeURIComponent('Impossible de vérifier le statut du paiement.'));
+    }
+
+    const data = await response.json();
+    const transaction = data?.transaction || data?.['v1/transaction'];
+    const txnStatus = transaction?.status;
+
+    if (txnStatus === 'approved') {
+      const db = getDB();
+      const targetUserId = userId as string;
+      
+      if (isSubscription === 'true') {
+        if (db.user && db.user.id === targetUserId) {
+          db.user.plan = 'pro';
+        }
+        const foundUser = db.users.find(u => u.id === targetUserId);
+        if (foundUser) {
+          foundUser.plan = 'pro';
+        }
+        
+        logActivity(
+          targetUserId,
+          db.user?.email || 'user@example.com',
+          'UPGRADE',
+          `Activation de la formule Mensuelle Pro via FedaPay API (5 USD) - Trans ID: ${transactionId}`,
+          db.user?.country || 'Sénégal',
+          5.0
+        );
+      } else if (dossierId) {
+        const targetDossierId = dossierId as string;
+        
+        if (db.user && db.user.id === targetUserId) {
+          if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+          if (!db.user.unlockedDossiers.includes(targetDossierId)) {
+            db.user.unlockedDossiers.push(targetDossierId);
+          }
+        }
+        
+        const foundUser = db.users.find(u => u.id === targetUserId);
+        if (foundUser) {
+          if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+          if (!foundUser.unlockedDossiers.includes(targetDossierId)) {
+            foundUser.unlockedDossiers.push(targetDossierId);
+          }
+        }
+
+        logActivity(
+          targetUserId,
+          db.user?.email || 'user@example.com',
+          'UPGRADE',
+          `Déverrouillage individuel du dossier ${targetDossierId} via FedaPay API (2.5 USD) - Trans ID: ${transactionId}`,
+          db.user?.country || 'Sénégal',
+          2.5
+        );
+      }
+      
+      saveDB(db);
+      return res.redirect('/?payment_status=success&message=' + encodeURIComponent('Votre paiement a été validé avec succès !'));
+    } else {
+      console.warn(`Transaction ${transactionId} not approved. Status is ${txnStatus}`);
+      return res.redirect('/?payment_status=failed&message=' + encodeURIComponent(`Le paiement n'a pas été approuvé (statut: ${txnStatus}).`));
+    }
+  } catch (error: any) {
+    console.error('Error handling payment callback:', error);
+    return res.redirect('/?payment_status=failed&message=' + encodeURIComponent('Erreur lors du traitement du retour de paiement.'));
+  }
+});
+
+app.get('/api/dossiers/download/:id', (req, res) => {
+  const db = getDB();
+  const dossierId = req.params.id;
+  const dossier = db.dossiers.find((d) => d.id === dossierId);
+
+
+  if (!dossier) {
+    return res.status(404).json({ error: 'Dossier introuvable' });
+  }
+
+  const user = db.user;
+  let isAllowed = false;
+
+  if (user && user.role === 'admin') {
+    isAllowed = true;
+  } else if (['essentiel', 'pro', 'business'].includes(user?.plan || 'free')) {
+    isAllowed = true;
+  } else if (user?.unlockedDossiers?.includes(dossierId)) {
+    isAllowed = true;
+  } else if ((user?.downloadedDossiers?.length || 0) === 0) {
+    // Consume the 1 free demo PDF download automatically
+    isAllowed = true;
+    if (user) {
+      if (!user.downloadedDossiers) user.downloadedDossiers = [];
+      user.downloadedDossiers.push(dossierId);
+      const foundUser = db.users.find(u => u.id === user.id);
+      if (foundUser) {
+        if (!foundUser.downloadedDossiers) foundUser.downloadedDossiers = [];
+        foundUser.downloadedDossiers.push(dossierId);
+      }
+      saveDB(db);
+    }
+  }
+
+  if (!isAllowed) {
+    return res.status(402).send(`
+      <html>
+        <head>
+          <title>Paiement requis - Candia</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 100px 20px; }
+            .card { background: #1e293b; max-width: 500px; margin: 0 auto; padding: 40px; border-radius: 24px; border: 1px solid #334155; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+            h1 { color: #f43f5e; margin-bottom: 20px; }
+            p { color: #94a3b8; font-size: 16px; line-height: 1.6; }
+            a { display: inline-block; background: #4f46e5; color: white; font-weight: bold; padding: 12px 30px; border-radius: 12px; text-decoration: none; margin-top: 25px; transition: background 0.2s; }
+            a:hover { background: #4338ca; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>Paiement requis 🔒</h1>
+            <p>Le téléchargement de ce dossier nécessite un abonnement actif ou l'achat d'un pass de génération unique.</p>
+            <p>Veuillez retourner sur l'application pour régler votre accès via FedaPay de manière 100% sécurisée.</p>
+            <a href="/">Retourner à l'application</a>
+          </div>
+        </body>
+      </html>
+    `);
   }
 
   // Check if it's the default demo PDF or a physically generated file

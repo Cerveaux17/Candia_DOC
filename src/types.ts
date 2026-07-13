@@ -14,6 +14,8 @@ export interface User {
   createdAt?: string;
   emailVerified?: boolean;
   role?: 'admin' | 'user';
+  unlockedDossiers?: string[];
+  downloadedDossiers?: string[];
 }
 
 export type DocumentCategory =

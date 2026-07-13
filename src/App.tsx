@@ -40,9 +40,11 @@ import {
   Eye,
   Settings,
   ChevronRight,
-  UserPlus
+  UserPlus,
+  Smartphone,
+  CreditCard
 } from 'lucide-react';
-import { STANDARD_CATEGORIES, CategoryDefinition, SafeDocument, RecruitmentOffer, GeneratedDossier, DocumentCategory } from './types';
+import { STANDARD_CATEGORIES, CategoryDefinition, SafeDocument, RecruitmentOffer, GeneratedDossier, DocumentCategory, User } from './types';
 
 function getCategoryLabel(category: string): string {
   const map: { [key: string]: string } = {
@@ -71,16 +73,7 @@ export default function App() {
   const [resetSentInfo, setResetSentInfo] = useState<{ link: string; expires: string } | null>(null);
 
   // User & Subscription states
-  const [user, setUser] = useState<{
-    id: string;
-    name: string;
-    email: string;
-    plan: 'free' | 'essentiel' | 'pro' | 'business';
-    monthlyDossiersCreated: number;
-    country: string;
-    emailVerified: boolean;
-    createdAt: string;
-  } | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [loadingUser, setLoadingUser] = useState(true);
 
   // Safe / Documents states
@@ -245,6 +238,35 @@ export default function App() {
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const [showPlanChangeConfirm, setShowPlanChangeConfirm] = useState<{ id: string; target: string } | null>(null);
   const [showCustomDocModal, setShowCustomDocModal] = useState(false);
+  const [showFedaPayModal, setShowFedaPayModal] = useState(false);
+  const [showFedaPaySimulator, setShowFedaPaySimulator] = useState(false);
+  const [fedaPayStatus, setFedaPayStatus] = useState<{
+    configured: boolean;
+    isLive: boolean;
+    mode: 'live' | 'sandbox_real' | 'simulation_local';
+    publicKeyPrefix: string | null;
+    secretKeyPrefix: string | null;
+  } | null>(null);
+  const [fedaPaySimulatedData, setFedaPaySimulatedData] = useState<{
+    amountUSD: number;
+    description: string;
+    isSubscription: boolean;
+    dossierId?: string;
+    url: string;
+  } | null>(null);
+
+  // FedaPay Simulator Form States
+  const [simulatedMethod, setSimulatedMethod] = useState<'momo' | 'card'>('momo');
+  const [simulatedOperator, setSimulatedOperator] = useState<string>('mtn');
+  const [simulatedPhoneNumber, setSimulatedPhoneNumber] = useState<string>('');
+  const [simulatedCardNumber, setSimulatedCardNumber] = useState<string>('');
+  const [simulatedCardExpiry, setSimulatedCardExpiry] = useState<string>('');
+  const [simulatedCardCVC, setSimulatedCardCVC] = useState<string>('');
+  const [isSimulatingProcess, setIsSimulatingProcess] = useState<boolean>(false);
+  const [simulatingStep, setSimulatingStep] = useState<number>(1);
+  const [simulatingCountdown, setSimulatingCountdown] = useState<number>(3);
+  const [dossierToDownload, setDossierToDownload] = useState<GeneratedDossier | null>(null);
+  const [isPaying, setIsPaying] = useState(false);
   const [customDocName, setCustomDocName] = useState('');
   const [customDocFile, setCustomDocFile] = useState<File | null>(null);
   const [customUploading, setCustomUploading] = useState(false);
@@ -253,9 +275,37 @@ export default function App() {
   const fileInputRefs = useRef<{ [key: string]: HTMLInputElement | null }>({});
   const offerFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Load Initial Session
+  const fetchFedaPayStatus = async () => {
+    try {
+      const res = await fetch('/api/payments/status');
+      if (res.ok) {
+        const data = await res.json();
+        setFedaPayStatus(data);
+      }
+    } catch (e) {
+      console.error('Error fetching FedaPay status:', e);
+    }
+  };
+
+  // Load Initial Session & Check payment callback parameters
   useEffect(() => {
     fetchSession();
+    fetchFedaPayStatus();
+
+    // Check for FedaPay payment query parameters
+    const params = new URLSearchParams(window.location.search);
+    const paymentStatus = params.get('payment_status');
+    const message = params.get('message');
+    
+    if (paymentStatus === 'success') {
+      showSuccess(message || 'Votre paiement a été validé avec succès ! 🎉');
+      // Clean query parameters from URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (paymentStatus === 'failed') {
+      showError(message || 'Le paiement a échoué.');
+      // Clean query parameters from URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
   }, []);
 
   const fetchSession = async () => {
@@ -281,6 +331,197 @@ export default function App() {
     } finally {
       setLoadingUser(false);
     }
+  };
+
+  const fetchSessionSilent = async () => {
+    try {
+      const res = await fetch('/api/user');
+      const data = await res.json();
+      if (data && data.id) {
+        setUser(data);
+      }
+    } catch (err) {
+      console.error('Silent session reload failed:', err);
+    }
+  };
+
+  const handleDownloadClick = async (e: React.MouseEvent, dossierId: string, dossierTitle: string) => {
+    e.preventDefault();
+    try {
+      const res = await fetch(`/api/dossiers/check-download/${dossierId}`);
+      const data = await res.json();
+      if (data.allowed) {
+        if (data.isFreeDemo) {
+          alert("Félicitations ! Vous téléchargez votre premier dossier PDF de démonstration gratuitement. Profitez-en ! 🎁");
+        }
+        // Start download
+        window.open(`/api/dossiers/download/${dossierId}`, '_blank');
+        // Refresh session to sync downloadedCount
+        setTimeout(() => {
+          fetchSessionSilent();
+        }, 1000);
+      } else {
+        // Show payment modal!
+        setDossierToDownload({ id: dossierId, title: dossierTitle } as any);
+        setShowFedaPayModal(true);
+      }
+    } catch (err) {
+      console.error("Error checking download permissions:", err);
+      // Fallback
+      window.open(`/api/dossiers/download/${dossierId}`, '_blank');
+    }
+  };
+
+  const payWithFedaPay = async (amountInUSD: number, description: string, isSubscription: boolean, dossierId?: string) => {
+    if (isPaying) return;
+    setIsPaying(true);
+
+    try {
+      // Refresh status just in case
+      let currentStatus = fedaPayStatus;
+      if (!currentStatus) {
+        try {
+          const sRes = await fetch('/api/payments/status');
+          if (sRes.ok) {
+            currentStatus = await sRes.json();
+            setFedaPayStatus(currentStatus);
+          }
+        } catch (e) {
+          console.error('Failed to fetch FedaPay status:', e);
+        }
+      }
+
+      const res = await fetch('/api/payments/create-checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amountUSD: amountInUSD, description, isSubscription, dossierId })
+      });
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        let displayError = errorText;
+        try {
+          const errJson = JSON.parse(errorText);
+          if (errJson.error) {
+            displayError = errJson.error;
+          }
+        } catch (e) {
+          // not JSON
+        }
+        throw new Error(displayError);
+      }
+
+      const data = await res.json();
+      if (data.simulated) {
+        setFedaPaySimulatedData({
+          amountUSD: amountInUSD,
+          description,
+          isSubscription,
+          dossierId,
+          url: data.url
+        });
+        setShowFedaPaySimulator(true);
+        setIsPaying(false);
+      } else if (data.url) {
+        // Rediriger le candidat vers la passerelle sécurisée FedaPay
+        window.location.href = data.url;
+      } else {
+        throw new Error('Pas d\'URL de paiement retournée par FedaPay.');
+      }
+    } catch (err: any) {
+      console.error('FedaPay Checkout API Error:', err);
+      
+      const isRealMode = fedaPayStatus?.mode === 'live' || fedaPayStatus?.mode === 'sandbox_real';
+      
+      if (isRealMode) {
+        // Show real error to the user and never trigger simulator
+        showError(`Échec de la transaction FedaPay : ${err.message || 'Une erreur est survenue lors de la création de la session de paiement.'}\n\nVeuillez vérifier vos clés secrètes FedaPay dans les variables d'environnement de votre projet.`);
+        setIsPaying(false);
+      } else {
+        // Fallback for simulation_local
+        setFedaPaySimulatedData({
+          amountUSD: amountInUSD,
+          description,
+          isSubscription,
+          dossierId,
+          url: `/api/payments/callback?id=mock_txn_${Date.now()}&status=approved&dossierId=${dossierId || ''}&isSubscription=${isSubscription ? 'true' : 'false'}&userId=${user?.id || 'sim'}`
+        });
+        setShowFedaPaySimulator(true);
+        setIsPaying(false);
+      }
+    }
+  };
+
+  const completePayment = async (isSubscription: boolean, dossierId?: string, transactionId?: string) => {
+    try {
+      if (isSubscription) {
+        const res = await fetch('/api/user/upgrade-to-paid', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transactionId })
+        });
+        const data = await res.json();
+        if (data.success) {
+          setUser(data.user);
+          setSuccessMsg('Félicitations ! Votre abonnement Mensuel (5$ / mois) a été activé avec succès ! 🎉');
+          setShowUpgradeModal(false);
+          setShowFedaPayModal(false);
+        }
+      } else if (dossierId) {
+        const res = await fetch('/api/dossiers/unlock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dossierId, transactionId })
+        });
+        const data = await res.json();
+        if (data.success) {
+          setUser(data.user);
+          setSuccessMsg('Dossier déverrouillé avec succès ! Téléchargement en cours... 📄');
+          setShowFedaPayModal(false);
+          // Trigger download immediately
+          window.open(`/api/dossiers/download/${dossierId}`, '_blank');
+        }
+      }
+      await fetchHistory();
+    } catch (err) {
+      console.error('Error completing payment:', err);
+      alert('Erreur technique lors de l\'enregistrement du paiement.');
+    } finally {
+      setIsPaying(false);
+    }
+  };
+
+  const handleSimulatedPayment = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!fedaPaySimulatedData) return;
+
+    setIsSimulatingProcess(true);
+    setSimulatingStep(1);
+
+    setTimeout(() => {
+      setSimulatingStep(2);
+
+      setTimeout(() => {
+        setSimulatingStep(3);
+        setSimulatingCountdown(3);
+
+        const interval = setInterval(() => {
+          setSimulatingCountdown((prev) => {
+            if (prev <= 1) {
+              clearInterval(interval);
+              setSimulatingStep(4);
+              
+              setTimeout(() => {
+                window.location.href = fedaPaySimulatedData.url;
+              }, 1500);
+              return 0;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+
+      }, 1200);
+    }, 1200);
   };
 
   const fetchSafeDocs = async () => {
@@ -405,20 +646,25 @@ export default function App() {
   };
 
   const handlePlanChange = async (targetPlan: 'free' | 'essentiel' | 'pro' | 'business') => {
-    try {
-      const res = await fetch('/api/user/change-plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ plan: targetPlan })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setUser(data);
-        showSuccess(`Votre abonnement a été mis à jour avec succès : Formule ${targetPlan.toUpperCase()} activée !`);
-        setShowUpgradeModal(false);
+    if (targetPlan === 'free') {
+      try {
+        const res = await fetch('/api/user/change-plan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plan: 'free' })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          setUser(data);
+          showSuccess("Formule Démo activée.");
+          setShowUpgradeModal(false);
+        }
+      } catch (err) {
+        showError("Échec de la modification d'abonnement.");
       }
-    } catch (err) {
-      showError("Échec de la modification d'abonnement.");
+    } else {
+      // Intégration FedaPay pour l'abonnement Mensuel Pro à 5 USD
+      payWithFedaPay(5.0, "Abonnement Mensuel Candia Pro (5 USD)", true);
     }
   };
 
@@ -1103,19 +1349,6 @@ export default function App() {
                             >
                               Admin Démo 🔑
                             </button>
-                          </div>
-                        </div>
-
-                        <div className="bg-indigo-950/20 border border-indigo-900/30 rounded-2xl p-4 text-[11px] text-slate-300 space-y-1.5">
-                          <p className="font-bold text-indigo-400 flex items-center gap-1.5">
-                            <ShieldAlert className="w-3.5 h-3.5 text-indigo-400" /> Accès Administrateur Candia
-                          </p>
-                          <p className="text-slate-400 leading-normal">
-                            Pour tester les fonctionnalités administratives modernes (gestion des utilisateurs, suspension, modification de forfaits, et logs de sécurité), utilisez les identifiants ou le raccourci ci-dessus :
-                          </p>
-                          <div className="bg-slate-950/40 rounded-xl p-2.5 border border-slate-850 font-mono text-slate-400">
-                            Email: <span className="text-indigo-300 font-semibold">admin@candia.ai</span><br />
-                            Mot de passe: <span className="text-indigo-300 font-semibold">AdminPassword2026!</span>
                           </div>
                         </div>
 
@@ -1888,15 +2121,13 @@ export default function App() {
                         </div>
                       </div>
 
-                      <a
-                        href={`/api/dossiers/download/${generationSuccess.id}`}
-                        target="_blank"
-                        rel="noreferrer"
+                      <button
+                        onClick={(e) => handleDownloadClick(e, generationSuccess.id, generationSuccess.title)}
                         className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-6 rounded-2xl text-sm transition-all shadow-md shadow-emerald-100 cursor-pointer w-full sm:w-auto justify-center shrink-0"
                       >
                         <Download className="w-4 h-4" />
                         Télécharger le dossier PDF
-                      </a>
+                      </button>
                     </div>
                   )}
 
@@ -2072,15 +2303,13 @@ export default function App() {
                           </div>
 
                           <div className="flex gap-2 w-full md:w-auto shrink-0">
-                            <a
-                              href={`/api/dossiers/download/${item.id}`}
-                              target="_blank"
-                              rel="noreferrer"
+                            <button
+                              onClick={(e) => handleDownloadClick(e, item.id, item.title)}
                               className="flex items-center gap-1.5 text-xs font-bold bg-white hover:bg-slate-50 text-slate-700 py-2.5 px-4 rounded-xl border border-slate-200 cursor-pointer shadow-3xs text-center justify-center w-full md:w-auto"
                             >
                               <Download className="w-4 h-4 text-slate-500" />
                               Télécharger
-                            </a>
+                            </button>
                           </div>
                         </div>
                       ))}
@@ -2099,6 +2328,39 @@ export default function App() {
                 exit={{ opacity: 0, y: -15 }}
                 className="space-y-8"
               >
+                {/* System & FedaPay Gateway Status Banner */}
+                {fedaPayStatus && (
+                  <div className={`p-6 rounded-3xl border flex flex-col md:flex-row items-start md:items-center justify-between gap-4 ${
+                    fedaPayStatus.mode === 'live'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                      : fedaPayStatus.mode === 'sandbox_real'
+                      ? 'bg-blue-50 border-blue-200 text-blue-900'
+                      : 'bg-amber-50 border-amber-200 text-amber-900'
+                  }`}>
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 font-display font-extrabold text-sm">
+                        <span className={`w-2.5 h-2.5 rounded-full ${
+                          fedaPayStatus.mode === 'live' ? 'bg-emerald-500' : fedaPayStatus.mode === 'sandbox_real' ? 'bg-blue-500' : 'bg-amber-500 animate-pulse'
+                        }`} />
+                        {fedaPayStatus.mode === 'live' && <span>Passerelle de Paiement FedaPay : MODE RÉEL ACTIF (Production)</span>}
+                        {fedaPayStatus.mode === 'sandbox_real' && <span>Passerelle de Paiement FedaPay : MODE SANDBOX RÉEL (Test)</span>}
+                        {fedaPayStatus.mode === 'simulation_local' && <span>Passerelle de Paiement FedaPay : MODE SIMULATION LOCALE</span>}
+                      </div>
+                      <p className="text-xs text-slate-600 max-w-2xl leading-relaxed">
+                        {fedaPayStatus.mode === 'simulation_local' 
+                          ? "L'application fonctionne actuellement en mode simulation locale Candia car aucune clé secrète FedaPay n'est configurée dans vos variables d'environnement. Configurez FEDAPAY_SECRET_KEY et VITE_FEDAPAY_PUBLIC_KEY dans les réglages du projet pour basculer en mode réel."
+                          : `La passerelle de paiement FedaPay est configurée avec succès ! Les transactions de Mobile Money et Cartes Bancaires transitent directement par vos clés API FedaPay (${fedaPayStatus.mode === 'live' ? 'Production' : 'Sandbox'}). Préfixe de la clé : ${fedaPayStatus.secretKeyPrefix}.`
+                        }
+                      </p>
+                    </div>
+                    {fedaPayStatus.mode === 'simulation_local' && (
+                      <div className="bg-amber-500 text-white font-bold text-[10px] uppercase tracking-wider px-3 py-1.5 rounded-xl shrink-0 self-start md:self-center">
+                        ⚠️ Configuration Requise
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Executive overview row of KPI cards */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
                   
@@ -2560,12 +2822,12 @@ export default function App() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
-            className="bg-white rounded-3xl max-w-4xl w-full border border-slate-200 overflow-hidden shadow-2xl p-6 sm:p-8"
+            className="bg-white rounded-3xl max-w-3xl w-full border border-slate-200 overflow-hidden shadow-2xl p-6 sm:p-8"
           >
             <div className="flex justify-between items-center pb-4 border-b border-slate-100">
               <h3 className="font-display font-bold text-xl text-slate-900 flex items-center gap-2">
                 <Sparkles className="w-5 h-5 text-amber-500 fill-amber-100" />
-                Formules d'Abonnement Candia
+                Formules & Tarification Candia
               </h3>
               <button
                 onClick={() => setShowUpgradeModal(false)}
@@ -2575,21 +2837,24 @@ export default function App() {
               </button>
             </div>
 
-            {/* Matrix tables pricing card */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
               
-              {/* Formule Essentiel */}
-              <div className={`rounded-2xl border p-5 flex flex-col justify-between transition-all ${user?.plan === 'essentiel' ? 'border-indigo-600 bg-indigo-50/10' : 'border-slate-200 hover:border-indigo-500'}`}>
+              {/* Formule Démo */}
+              <div className={`rounded-2xl border p-5 flex flex-col justify-between transition-all ${user?.plan !== 'pro' ? 'border-indigo-600 bg-indigo-50/10' : 'border-slate-200 hover:border-indigo-500'}`}>
                 <div>
-                  <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase">Formule Essentiel</span>
+                  <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase">Formule Démo</span>
                   <div className="mt-3">
-                    <span className="font-display font-extrabold text-2xl text-slate-900">3 000 FCFA</span>
-                    <span className="text-slate-500 text-xs"> / mois</span>
+                    <span className="font-display font-extrabold text-2xl text-slate-900">Gratuit</span>
+                    <span className="text-slate-500 text-xs"> (Mode d'essai)</span>
                   </div>
                   <ul className="mt-4 space-y-2 text-xs text-slate-600">
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500" />
-                      Dossiers de soumission **Illimités**
+                      <strong>1er téléchargement PDF 100% offert</strong>
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <Check className="w-4 h-4 text-emerald-500" />
+                      Création libre de dossiers de soumission
                     </li>
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500" />
@@ -2597,37 +2862,33 @@ export default function App() {
                     </li>
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500" />
-                      Historique conservé 30 jours
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      1 profil unique
+                      Assistance IA et lettre de motivation
                     </li>
                   </ul>
                 </div>
                 <button
-                  onClick={() => handlePlanChange('essentiel')}
-                  className="w-full mt-6 py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition-colors cursor-pointer"
+                  onClick={() => handlePlanChange('free')}
+                  className="w-full mt-6 py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors cursor-pointer"
                 >
-                  {user?.plan === 'essentiel' ? 'Votre plan actuel' : 'Activer l\'abonnement'}
+                  {user?.plan !== 'pro' ? 'Votre plan actuel' : 'Repasser au plan gratuit'}
                 </button>
               </div>
 
-              {/* Formule Pro */}
+              {/* Formule Mensuelle Pro */}
               <div className={`rounded-2xl border-2 p-5 flex flex-col justify-between transition-all relative ${user?.plan === 'pro' ? 'border-amber-500 bg-amber-50/10' : 'border-amber-500/50 hover:border-amber-500 bg-amber-50/5'}`}>
-                <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-amber-500 text-white font-bold text-[9px] uppercase tracking-wider px-3 py-1 rounded-full border border-amber-400">
+                <div className="absolute -top-3 right-4 bg-amber-500 text-white font-bold text-[9px] uppercase tracking-wider px-3 py-1 rounded-full border border-amber-400">
                   Recommandé 🔥
                 </div>
                 <div className="pt-2">
-                  <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full uppercase">Formule Pro</span>
+                  <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full uppercase">Formule Mensuelle</span>
                   <div className="mt-3">
-                    <span className="font-display font-extrabold text-2xl text-slate-900">7 500 FCFA</span>
-                    <span className="text-slate-500 text-xs"> / mois</span>
+                    <span className="font-display font-extrabold text-2xl text-slate-900">5 USD</span>
+                    <span className="text-slate-500 text-xs"> / mois (environ 3 000 FCFA)</span>
                   </div>
                   <ul className="mt-4 space-y-2 text-xs text-slate-600">
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500 font-bold" />
-                      <strong>Générations de PDF Illimitées</strong>
+                      <strong>Téléchargements de PDF Illimités</strong>
                     </li>
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500" />
@@ -2635,15 +2896,11 @@ export default function App() {
                     </li>
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500" />
-                      Signature automatique sécurisée
+                      Signature manuscrite automatique
                     </li>
                     <li className="flex items-center gap-2">
                       <Check className="w-4 h-4 text-emerald-500" />
-                      Historique des dossiers illimité
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Export Word & PDF fusionnés
+                      Zéro publicité ni limite de stockage
                     </li>
                   </ul>
                 </div>
@@ -2651,46 +2908,356 @@ export default function App() {
                   onClick={() => handlePlanChange('pro')}
                   className="w-full mt-6 py-2.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold transition-colors cursor-pointer shadow-xs"
                 >
-                  {user?.plan === 'pro' ? 'Votre plan actuel' : 'Activer l\'abonnement Pro'}
-                </button>
-              </div>
-
-              {/* Formule Business */}
-              <div className={`rounded-2xl border p-5 flex flex-col justify-between transition-all ${user?.plan === 'business' ? 'border-emerald-600 bg-emerald-50/10' : 'border-slate-200 hover:border-emerald-500'}`}>
-                <div>
-                  <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full uppercase">Formule Business</span>
-                  <div className="mt-3">
-                    <span className="font-display font-extrabold text-2xl text-slate-900">15 000 FCFA</span>
-                    <span className="text-slate-500 text-xs"> / mois</span>
-                  </div>
-                  <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Générations de PDF Illimitées
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      <strong>Multi-profils</strong> (idéal agence ou famille)
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Tableau de statistiques d'usage
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Support prioritaire par WhatsApp 24/7
-                    </li>
-                  </ul>
-                </div>
-                <button
-                  onClick={() => handlePlanChange('business')}
-                  className="w-full mt-6 py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors cursor-pointer"
-                >
-                  {user?.plan === 'business' ? 'Votre plan actuel' : 'Activer l\'abonnement Business'}
+                  {user?.plan === 'pro' ? 'Abonnement Actif' : 'Activer l\'abonnement Mensuel (5 USD)'}
                 </button>
               </div>
 
             </div>
+
+            {/* A l'unité option */}
+            <div className="mt-6 p-4 rounded-2xl bg-indigo-50/50 border border-indigo-100/50 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <h4 className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                  <Info className="w-4 h-4 text-indigo-600" />
+                  Option d'achat à l'acte : 2.5 USD (~1 500 FCFA) par dossier
+                </h4>
+                <p className="text-[11px] text-indigo-700 leading-relaxed">
+                  Pas besoin d'abonnement ? Créez et organisez vos dossiers gratuitement. Vous ne payez que lors du téléchargement de vos dossiers validés, de manière unitaire.
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* FedaPay Checkout Choice Modal */}
+      {showFedaPayModal && dossierToDownload && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className="bg-white rounded-3xl max-w-xl w-full border border-slate-200 overflow-hidden shadow-2xl p-6 sm:p-8"
+          >
+            <div className="flex justify-between items-center pb-4 border-b border-slate-100">
+              <h3 className="font-display font-bold text-lg text-slate-900 flex items-center gap-2">
+                <Lock className="w-5 h-5 text-indigo-600" />
+                Déverrouiller le téléchargement 🔓
+              </h3>
+              <button
+                onClick={() => setShowFedaPayModal(false)}
+                className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-xl transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="mt-4">
+              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block">Dossier sélectionné</span>
+              <h4 className="font-bold text-slate-800 text-sm mt-1">{dossierToDownload.title}</h4>
+              <p className="text-xs text-slate-500 mt-2">
+                Le dossier PDF a été entièrement compilé et ordonné de façon certifiée. Pour le télécharger sur votre appareil, veuillez choisir l'un des modes de règlement ci-dessous :
+              </p>
+            </div>
+
+            {fedaPayStatus && (
+              <div className={`mt-4 p-4 rounded-2xl border text-xs leading-relaxed space-y-1.5 ${
+                fedaPayStatus.mode === 'live'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : fedaPayStatus.mode === 'sandbox_real'
+                  ? 'bg-blue-50 border-blue-200 text-blue-800'
+                  : 'bg-amber-50 border-amber-200 text-amber-800'
+              }`}>
+                <div className="flex items-center gap-1.5 font-bold">
+                  <div className={`w-2 h-2 rounded-full ${
+                    fedaPayStatus.mode === 'live' ? 'bg-emerald-500' : fedaPayStatus.mode === 'sandbox_real' ? 'bg-blue-500' : 'bg-amber-500 animate-pulse'
+                  }`} />
+                  {fedaPayStatus.mode === 'live' && <span>🟢 Mode Réel FedaPay Actif (Production)</span>}
+                  {fedaPayStatus.mode === 'sandbox_real' && <span>🔵 Mode Sandbox FedaPay Actif (Test)</span>}
+                  {fedaPayStatus.mode === 'simulation_local' && <span>⚠️ Mode Simulation (Pas de clé FedaPay)</span>}
+                </div>
+                {fedaPayStatus.mode === 'simulation_local' ? (
+                  <p className="text-[10px] text-amber-700 leading-normal">
+                    L'application est en mode simulation locale car aucune clé API FedaPay n'est définie. Pour encaisser de <strong>vrais paiements Mobile Money / Carte</strong>, ajoutez vos variables d'environnement <code className="bg-amber-100 px-1 rounded">FEDAPAY_SECRET_KEY</code> et <code className="bg-amber-100 px-1 rounded">VITE_FEDAPAY_PUBLIC_KEY</code>.
+                  </p>
+                ) : (
+                  <p className="text-[10px] leading-normal opacity-90">
+                    Connexion sécurisée établie avec FedaPay ({fedaPayStatus.mode === 'live' ? 'Production' : 'Sandbox'}). Clé : <code className="bg-black/5 px-1 rounded">{fedaPayStatus.secretKeyPrefix}</code>. Vous allez être redirigé vers l'interface de paiement officielle.
+                  </p>
+                )}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-6">
+              
+              {/* Option 1: Acte */}
+              <button
+                onClick={() => payWithFedaPay(2.5, `Achat Unitaire Dossier: ${dossierToDownload.title}`, false, dossierToDownload.id)}
+                disabled={isPaying}
+                className="rounded-2xl border border-slate-200 hover:border-indigo-500 p-5 flex flex-col justify-between text-left transition-all hover:bg-indigo-50/5 cursor-pointer disabled:opacity-50"
+              >
+                <div>
+                  <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase">Paiement à l'acte</span>
+                  <div className="mt-3">
+                    <span className="font-display font-extrabold text-xl text-slate-900">2.5 USD</span>
+                    <span className="text-slate-500 text-[10px] block">~1 500 FCFA à l'unité</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+                    Déverrouille uniquement ce dossier PDF de candidature.
+                  </p>
+                </div>
+                <span className="mt-6 text-xs font-bold text-indigo-600 flex items-center gap-1">
+                  Acheter ce PDF <ArrowRight className="w-3.5 h-3.5" />
+                </span>
+              </button>
+
+              {/* Option 2: Subscription */}
+              <button
+                onClick={() => payWithFedaPay(5.0, "Abonnement Mensuel Candia Pro (5 USD)", true)}
+                disabled={isPaying}
+                className="rounded-2xl border-2 border-amber-500 bg-amber-50/5 hover:bg-amber-50/10 p-5 flex flex-col justify-between text-left transition-all relative cursor-pointer disabled:opacity-50"
+              >
+                <div className="absolute -top-3 right-4 bg-amber-500 text-white font-bold text-[8px] uppercase tracking-wider px-2.5 py-0.5 rounded-full">
+                  Économique 💡
+                </div>
+                <div>
+                  <span className="text-[9px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full uppercase">Formule Mensuelle</span>
+                  <div className="mt-3">
+                    <span className="font-display font-extrabold text-xl text-slate-900">5.0 USD</span>
+                    <span className="text-slate-500 text-[10px] block">~3 000 FCFA par mois</span>
+                  </div>
+                  <p className="text-[11px] text-slate-600 mt-2 leading-relaxed">
+                    <strong>Téléchargements Illimités</strong> pour tous vos dossiers créés.
+                  </p>
+                </div>
+                <span className="mt-6 text-xs font-bold text-amber-600 flex items-center gap-1">
+                  S'abonner (Illimité) <ArrowRight className="w-3.5 h-3.5" />
+                </span>
+              </button>
+
+            </div>
+
+            <div className="mt-6 pt-4 border-t border-slate-100 flex items-center gap-3 text-slate-400">
+              <Shield className="w-8 h-8 text-emerald-600 shrink-0" />
+              <div className="text-[10px] text-slate-500 leading-normal">
+                Passerelle de paiement sécurisée **FedaPay**. Vos fonds et vos transactions de Mobile Money (Orange, MTN, Wave, Moov, Free) et Cartes Bancaires (Visa, MasterCard) sont chiffrés et sécurisés.
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* FedaPay Sandbox Simulator Modal */}
+      {showFedaPaySimulator && fedaPaySimulatedData && (
+        <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className="bg-white rounded-3xl max-w-md w-full border border-slate-200 overflow-hidden shadow-2xl p-6"
+          >
+            {/* Header */}
+            <div className="flex justify-between items-center pb-4 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="bg-emerald-100 p-1.5 rounded-lg text-emerald-600 font-extrabold text-[10px] tracking-wider">FedaPay</div>
+                <span className="text-[10px] font-bold text-slate-400">| Sandbox Simulator</span>
+              </div>
+              {!isSimulatingProcess && (
+                <button
+                  onClick={() => {
+                    setShowFedaPaySimulator(false);
+                    setIsPaying(false);
+                  }}
+                  className="p-1 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-lg transition-colors cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            {/* Merchant info & amount */}
+            <div className="my-5 text-center bg-slate-50 rounded-2xl p-4 border border-slate-100">
+              <span className="text-[9px] uppercase tracking-widest font-bold text-slate-400">Marchand</span>
+              <h4 className="font-bold text-slate-800 text-xs">Candia - Concours Agricoles</h4>
+              
+              <div className="mt-3">
+                <span className="text-xl font-extrabold text-slate-900">
+                  {Math.round(fedaPaySimulatedData.amountUSD * 600).toLocaleString()} FCFA
+                </span>
+                <span className="text-[9px] text-slate-400 block mt-0.5">({fedaPaySimulatedData.amountUSD} USD)</span>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-2 bg-white px-2 py-1 rounded-md border border-slate-100 truncate">
+                {fedaPaySimulatedData.description}
+              </p>
+            </div>
+
+            {isSimulatingProcess ? (
+              /* Simulated payment steps */
+              <div className="py-6 flex flex-col items-center justify-center text-center">
+                {simulatingStep === 1 && (
+                  <div className="space-y-4">
+                    <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin mx-auto" />
+                    <h4 className="font-bold text-slate-800 text-xs">Validation des informations...</h4>
+                    <p className="text-[11px] text-slate-500">Nous vérifions vos coordonnées de paiement.</p>
+                  </div>
+                )}
+                {simulatingStep === 2 && (
+                  <div className="space-y-4">
+                    <RefreshCw className="w-8 h-8 text-emerald-600 animate-spin mx-auto" />
+                    <h4 className="font-bold text-slate-800 text-xs">Connexion sécurisée à FedaPay...</h4>
+                    <p className="text-[11px] text-slate-500">Établissement du canal sécurisé SSL.</p>
+                  </div>
+                )}
+                {simulatingStep === 3 && (
+                  <div className="space-y-4">
+                    <div className="relative mx-auto w-10 h-10 flex items-center justify-center">
+                      <Smartphone className="w-8 h-8 text-amber-500 animate-bounce" />
+                      <span className="absolute -top-1 -right-1 bg-amber-500 text-white rounded-full text-[9px] font-bold w-4 h-4 flex items-center justify-center animate-pulse">
+                        {simulatingCountdown}
+                      </span>
+                    </div>
+                    <h4 className="font-bold text-slate-800 text-xs">Validation USSD en cours...</h4>
+                    <p className="text-[11px] text-slate-600 px-4 leading-relaxed">
+                      Saisissez votre code secret sur le prompt Mobile Money de votre téléphone pour valider le débit de <strong className="text-slate-900">{Math.round(fedaPaySimulatedData.amountUSD * 600)} FCFA</strong>.
+                    </p>
+                    <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-[9px] text-amber-800 max-w-xs mx-auto">
+                      Simulation en cours. Ne fermez pas cette fenêtre.
+                    </div>
+                  </div>
+                )}
+                {simulatingStep === 4 && (
+                  <div className="space-y-4">
+                    <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto animate-pulse" />
+                    <h4 className="font-bold text-emerald-700 text-xs">Paiement approuvé ! 🎉</h4>
+                    <p className="text-[11px] text-slate-500">Votre transaction a été validée avec succès.</p>
+                    <p className="text-[9px] text-slate-400">Redirection automatique dans un instant...</p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Simulation Form */
+              <form onSubmit={handleSimulatedPayment} className="space-y-4">
+                {/* Tabs */}
+                <div className="grid grid-cols-2 gap-2 bg-slate-100 p-1 rounded-xl">
+                  <button
+                    type="button"
+                    onClick={() => setSimulatedMethod('momo')}
+                    className={`py-1.5 text-xs font-bold rounded-lg flex items-center justify-center gap-1 cursor-pointer transition-all ${
+                      simulatedMethod === 'momo' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <Smartphone className="w-3.5 h-3.5" />
+                    Mobile Money
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSimulatedMethod('card')}
+                    className={`py-1.5 text-xs font-bold rounded-lg flex items-center justify-center gap-1 cursor-pointer transition-all ${
+                      simulatedMethod === 'card' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <CreditCard className="w-3.5 h-3.5" />
+                    Carte Bancaire
+                  </button>
+                </div>
+
+                {simulatedMethod === 'momo' ? (
+                  /* Mobile Money Form */
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-[9px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Opérateur</label>
+                      <div className="grid grid-cols-4 gap-2">
+                        {[
+                          { id: 'mtn', name: 'MTN', color: 'bg-yellow-400 text-yellow-950 border-yellow-500' },
+                          { id: 'moov', name: 'Moov', color: 'bg-blue-600 text-white border-blue-700' },
+                          { id: 'orange', name: 'Orange', color: 'bg-orange-500 text-white border-orange-600' },
+                          { id: 'wave', name: 'Wave', color: 'bg-sky-400 text-white border-sky-500' }
+                        ].map((op) => (
+                          <button
+                            key={op.id}
+                            type="button"
+                            onClick={() => setSimulatedOperator(op.id)}
+                            className={`py-1 px-1 rounded-lg border text-[10px] font-bold text-center cursor-pointer transition-all ${
+                              simulatedOperator === op.id ? `${op.color} ring-2 ring-indigo-500/30 scale-105` : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                            }`}
+                          >
+                            {op.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="text-[9px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Numéro de téléphone</label>
+                      <input
+                        type="tel"
+                        required
+                        placeholder="Ex: +229 97 00 00 00"
+                        value={simulatedPhoneNumber}
+                        onChange={(e) => setSimulatedPhoneNumber(e.target.value)}
+                        className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+                      />
+                      <span className="text-[9px] text-slate-400 block mt-1">Saisissez n'importe quel numéro de démonstration.</span>
+                    </div>
+                  </div>
+                ) : (
+                  /* Card Form */
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-[9px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Numéro de carte</label>
+                      <input
+                        type="text"
+                        required
+                        maxLength={19}
+                        placeholder="4000 1234 5678 9010"
+                        value={simulatedCardNumber}
+                        onChange={(e) => setSimulatedCardNumber(e.target.value)}
+                        className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[9px] uppercase tracking-wider font-bold text-slate-500 block mb-1">Expiration</label>
+                        <input
+                          type="text"
+                          required
+                          maxLength={5}
+                          placeholder="MM/AA"
+                          value={simulatedCardExpiry}
+                          onChange={(e) => setSimulatedCardExpiry(e.target.value)}
+                          className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-center"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9px] uppercase tracking-wider font-bold text-slate-500 block mb-1">CVC</label>
+                        <input
+                          type="text"
+                          required
+                          maxLength={3}
+                          placeholder="123"
+                          value={simulatedCardCVC}
+                          onChange={(e) => setSimulatedCardCVC(e.target.value)}
+                          className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-center"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Confirm Button */}
+                <button
+                  type="submit"
+                  className="w-full mt-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-bold text-xs transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  Payer {Math.round(fedaPaySimulatedData.amountUSD * 600).toLocaleString()} FCFA
+                </button>
+
+                <p className="text-[8px] text-center text-slate-400 px-4 leading-normal mt-2">
+                  En cliquant sur Payer, vous initiez une transaction simulée dans le sandbox FedaPay de l'application. Aucun solde réel ne sera débité.
+                </p>
+              </form>
+            )}
           </motion.div>
         </div>
       )}
