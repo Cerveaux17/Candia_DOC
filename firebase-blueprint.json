@@ -1,0 +1,112 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile inside Candia SaaS.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "plan": { "type": "string", "enum": ["free", "essentiel", "pro", "business"] },
+        "monthlyDossiersCreated": { "type": "number" },
+        "country": { "type": "string" },
+        "isSuspended": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "emailVerified": { "type": "boolean" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "unlockedDossiers": { "type": "array" },
+        "downloadedDossiers": { "type": "array" }
+      },
+      "required": ["id", "name", "email", "plan", "monthlyDossiersCreated"]
+    },
+    "SafeDocument": {
+      "title": "SafeDocument",
+      "description": "A document uploaded to the user's secure safe.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "category": { "type": "string" },
+        "originalName": { "type": "string" },
+        "mimeType": { "type": "string" },
+        "size": { "type": "number" },
+        "uploadedAt": { "type": "string" },
+        "path": { "type": "string" }
+      },
+      "required": ["id", "userId", "category", "originalName", "mimeType", "size", "uploadedAt", "path"]
+    },
+    "RecruitmentOffer": {
+      "title": "RecruitmentOffer",
+      "description": "Recruitment offer analyzed by the user.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "organizer": { "type": "string" },
+        "deadline": { "type": "string" },
+        "originalFileName": { "type": "string" },
+        "extractedPieces": { "type": "array" },
+        "rawText": { "type": "string" },
+        "analyzedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "title", "organizer", "deadline", "originalFileName", "extractedPieces", "analyzedAt"]
+    },
+    "GeneratedDossier": {
+      "title": "GeneratedDossier",
+      "description": "A generated dossier in PDF format.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "organizer": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "pdfPath": { "type": "string" },
+        "size": { "type": "number" },
+        "piecesIncluded": { "type": "array" },
+        "hasCoverPage": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["success", "failed"] }
+      },
+      "required": ["id", "userId", "title", "organizer", "createdAt", "pdfPath", "size", "piecesIncluded", "hasCoverPage", "status"]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "An audit log of user or admin activity.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "action": { "type": "string" },
+        "details": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "ip": { "type": "string" }
+      },
+      "required": ["id", "userId", "userEmail", "action", "details", "timestamp"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "SaaS Users profile"
+    },
+    "documents/{docId}": {
+      "schema": "SafeDocument",
+      "description": "User uploaded safe documents"
+    },
+    "offers/{offerId}": {
+      "schema": "RecruitmentOffer",
+      "description": "Analyzed job and recruitment offers"
+    },
+    "dossiers/{dossierId}": {
+      "schema": "GeneratedDossier",
+      "description": "Generated compilation dossier PDFs"
+    },
+    "activityLogs/{logId}": {
+      "schema": "ActivityLog",
+      "description": "Activity audit logs for admin audit"
+    }
+  }
+}
