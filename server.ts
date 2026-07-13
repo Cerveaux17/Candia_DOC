@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { syncFromFirestore, saveEntityToFirestore, deleteEntityFromFirestore } from './server-firebase';
 
 // Load environment variables
 dotenv.config();
@@ -381,6 +382,23 @@ const DEFAULT_DB: LocalDB = {
   ],
 };
 
+// On startup, synchronize with Firestore and recreate local db.json
+async function initServerDatabase() {
+  console.log('🔥 Initializing Cloud Firestore sync on server start...');
+  const syncedDb = await syncFromFirestore(DEFAULT_DB);
+  if (syncedDb) {
+    try {
+      fs.writeFileSync(DB_FILE, JSON.stringify(syncedDb, null, 2), 'utf-8');
+      console.log('🔥 Local db.json loaded and synchronized successfully from Cloud Firestore.');
+    } catch (err) {
+      console.error('❌ Failed to write synced db.json:', err);
+    }
+  }
+}
+initServerDatabase().catch(err => {
+  console.error('❌ Firestore Sync Error on server start:', err);
+});
+
 function getDB(): LocalDB {
   try {
     if (fs.existsSync(DB_FILE)) {
@@ -471,6 +489,9 @@ function logActivity(userId: string, email: string, action: ActivityLog['action'
   };
   db.activityLogs.push(newLog);
   saveDB(db);
+  saveEntityToFirestore('activityLogs', newLog.id, newLog).catch(err => {
+    console.error('Error syncing log to Firestore:', err);
+  });
 }
 
 // -------------------------------------------------------------
@@ -481,6 +502,80 @@ function logActivity(userId: string, email: string, action: ActivityLog['action'
 app.get('/api/user', (req, res) => {
   const db = getDB();
   res.json(db.user);
+});
+
+app.post('/api/auth/firebase-sync', async (req, res) => {
+  try {
+    const { uid, email, name, country } = req.body;
+    if (!uid || !email) {
+      return res.status(400).json({ error: 'UID et Email requis.' });
+    }
+
+    const db = getDB();
+    let foundUser = db.users.find(u => u.id === uid || u.email.toLowerCase() === email.toLowerCase());
+
+    if (!foundUser) {
+      // Create a brand new Firebase user profile in DB
+      foundUser = {
+        id: uid,
+        name: name || email.split('@')[0],
+        email: email.toLowerCase(),
+        plan: 'free',
+        monthlyDossiersCreated: 0,
+        country: country || 'Sénégal',
+        isSuspended: false,
+        createdAt: new Date().toISOString(),
+        emailVerified: true,
+        lastActiveAt: new Date().toISOString(),
+        role: 'user',
+        unlockedDossiers: [],
+        downloadedDossiers: []
+      };
+      db.users.push(foundUser);
+      console.log(`👤 New Firebase-synced user created: ${foundUser.email}`);
+    } else {
+      // Migrate local ID to Firebase UID if needed
+      if (foundUser.id !== uid) {
+        const oldId = foundUser.id;
+        foundUser.id = uid;
+        db.dossiers.forEach(d => { if (d.userId === oldId) d.userId = uid; });
+        db.documents.forEach(doc => { if (doc.userId === oldId) doc.userId = uid; });
+        db.offers.forEach(o => { if (o.userId === oldId) o.userId = uid; });
+      }
+      foundUser.lastActiveAt = new Date().toISOString();
+      foundUser.emailVerified = true;
+      if (name) foundUser.name = name;
+      if (country) foundUser.country = country;
+    }
+
+    // Set active session user
+    db.user = {
+      id: foundUser.id,
+      name: foundUser.name,
+      email: foundUser.email,
+      plan: foundUser.plan,
+      monthlyDossiersCreated: foundUser.monthlyDossiersCreated,
+      country: foundUser.country,
+      emailVerified: foundUser.emailVerified,
+      createdAt: foundUser.createdAt,
+      role: foundUser.role || 'user',
+      unlockedDossiers: foundUser.unlockedDossiers || [],
+      downloadedDossiers: foundUser.downloadedDossiers || []
+    };
+
+    saveDB(db);
+    // Sync to Firestore in background
+    saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
+
+    logActivity(foundUser.id, foundUser.email, 'LOGIN', `Connexion Firebase/Google : ${foundUser.name}`, foundUser.country, 0);
+
+    res.json({ success: true, user: db.user });
+  } catch (error) {
+    console.error('Firebase Sync Error:', error);
+    res.status(500).json({ error: 'Échec de la synchronisation Firebase.' });
+  }
 });
 
 // Full Authentication & Profile endpoints
@@ -528,6 +623,9 @@ app.post('/api/auth/signup', (req, res) => {
     };
 
     saveDB(db);
+    saveEntityToFirestore('users', newUser.id, newUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
 
     logActivity(newUser.id, newUser.email, 'SIGNUP', `Nouvelle inscription : ${newUser.name} depuis le/la ${newUser.country}`, newUser.country, 0);
 
@@ -571,6 +669,9 @@ app.post('/api/auth/login', (req, res) => {
     };
 
     saveDB(db);
+    saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
 
     logActivity(foundUser.id, foundUser.email, 'LOGIN', `Connexion de l'utilisateur ${foundUser.name}`, foundUser.country, 0);
 
@@ -605,6 +706,9 @@ app.post('/api/auth/verify-email', (req, res) => {
     foundUser.emailVerified = true;
     db.user.emailVerified = true;
     saveDB(db);
+    saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
     logActivity(foundUser.id, foundUser.email, 'EMAIL_VERIFY', 'Vérification d\'adresse email réussie', foundUser.country, 0);
   }
   res.json({ success: true, user: db.user });
@@ -647,6 +751,9 @@ app.post('/api/auth/reset-password', (req, res) => {
 
   foundUser.password = newPassword;
   saveDB(db);
+  saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+    console.error('Error syncing user to Firestore:', err);
+  });
   res.json({ success: true, message: 'Votre mot de passe a été réinitialisé avec succès.' });
 });
 
@@ -669,6 +776,9 @@ app.post('/api/user/profile', (req, res) => {
       db.user.email = email;
     }
     saveDB(db);
+    saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
     res.json({ success: true, user: db.user });
   } else {
     res.status(404).json({ error: 'Utilisateur non connecté' });
@@ -693,6 +803,11 @@ app.post('/api/user/change-plan', (req, res) => {
   }
   
   saveDB(db);
+  if (foundUser) {
+    saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
+  }
   res.json(db.user);
 });
 
@@ -710,6 +825,11 @@ app.post('/api/user/toggle-plan', (req, res) => {
   }
   
   saveDB(db);
+  if (foundUser) {
+    saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+      console.error('Error syncing user to Firestore:', err);
+    });
+  }
   res.json(db.user);
 });
 
@@ -753,6 +873,9 @@ app.post('/api/safe/upload', upload.single('file'), (req, res) => {
         console.error('Could not delete old safe file:', e);
       }
       db.documents.splice(existingIndex, 1);
+      deleteEntityFromFirestore('documents', oldDoc.id).catch(err => {
+        console.error('Error deleting replaced document from Firestore:', err);
+      });
     }
 
     const newDoc = {
@@ -768,6 +891,9 @@ app.post('/api/safe/upload', upload.single('file'), (req, res) => {
 
     db.documents.push(newDoc);
     saveDB(db);
+    saveEntityToFirestore('documents', newDoc.id, newDoc).catch(err => {
+      console.error('Error syncing document to Firestore:', err);
+    });
 
     res.json({ success: true, document: newDoc });
   } catch (error) {
@@ -794,6 +920,9 @@ app.delete('/api/safe/:id', (req, res) => {
 
   db.documents.splice(index, 1);
   saveDB(db);
+  deleteEntityFromFirestore('documents', req.params.id).catch(err => {
+    console.error('Error deleting document from Firestore:', err);
+  });
 
   res.json({ success: true, message: 'Document supprimé' });
 });
@@ -1047,6 +1176,9 @@ app.post('/api/safe/save-text', async (req, res) => {
 
     db.documents.push(newDoc);
     saveDB(db);
+    saveEntityToFirestore('documents', newDoc.id, newDoc).catch(err => {
+      console.error('Error syncing document to Firestore:', err);
+    });
 
     res.json({ success: true, document: newDoc });
   } catch (error: any) {
@@ -1217,6 +1349,9 @@ Prends bien en compte l'ordre de présentation. Retourne le résultat strictemen
 
     db.offers.push(newOffer);
     saveDB(db);
+    saveEntityToFirestore('offers', newOffer.id, newOffer).catch(err => {
+      console.error('Error syncing offer to Firestore:', err);
+    });
 
     res.json(newOffer);
   } catch (error) {
@@ -1582,6 +1717,14 @@ app.post('/api/dossiers/generate', async (req, res) => {
 
     db.dossiers.push(newDossier);
     saveDB(db);
+    saveEntityToFirestore('dossiers', newDossier.id, newDossier).catch(err => {
+      console.error('Error syncing dossier to Firestore:', err);
+    });
+    if (sessionUser) {
+      saveEntityToFirestore('users', sessionUser.id, sessionUser).catch(err => {
+        console.error('Error syncing user' + 's counters to Firestore:', err);
+      });
+    }
 
     const payDetail = (currentPlan === 'free' && req.body.isPaidUnit) ? ' (Paiement à l\'unité de 2 000 FCFA)' : '';
     logActivity(db.user.id, db.user.email, 'GENERATE', `Génération de dossier PDF de soumission : ${offer.title}${payDetail}`, db.user.country || 'Sénégal', 0);

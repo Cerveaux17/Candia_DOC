@@ -38,6 +38,7 @@ import {
   Cpu,
   DownloadCloud,
   Eye,
+  EyeOff,
   Settings,
   ChevronRight,
   UserPlus,
@@ -71,6 +72,7 @@ export default function App() {
   const [authMode, setAuthMode] = useState<'login' | 'signup' | 'forgot'>('login');
   const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', country: 'Sénégal' });
   const [resetSentInfo, setResetSentInfo] = useState<{ link: string; expires: string } | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
 
   // User & Subscription states
   const [user, setUser] = useState<User | null>(null);
@@ -551,14 +553,58 @@ export default function App() {
   };
 
   // Auth Submit Handlers
+  const handleGoogleSignIn = async () => {
+    setErrorMsg(null);
+    try {
+      const { auth, signInWithPopup, googleProvider } = await import('./lib/firebase');
+      const result = await signInWithPopup(auth, googleProvider);
+      const fUser = result.user;
+      if (!fUser || !fUser.email) {
+        throw new Error("Impossible de récupérer les informations de votre compte Google.");
+      }
+
+      // Sync user to server
+      const res = await fetch('/api/auth/firebase-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: fUser.uid,
+          email: fUser.email,
+          name: fUser.displayName,
+          country: authForm.country || 'Sénégal'
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Erreur lors de la synchronisation de votre profil.');
+
+      setUser(data.user);
+      setIsLoggedIn(true);
+      setCandidateName(data.user.name);
+      setCandidateEmail(data.user.email);
+      showSuccess(`Bienvenue ${data.user.name} ! Connexion Google réussie.`);
+      await Promise.all([fetchSafeDocs(), fetchHistory()]);
+    } catch (err: any) {
+      console.error('Google Sign In Error:', err);
+      showError(err.message || 'Une erreur est survenue lors de la connexion Google.');
+    }
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
     try {
-      const res = await fetch('/api/auth/login', {
+      const { auth, signInWithEmailAndPassword } = await import('./lib/firebase');
+      const userCredential = await signInWithEmailAndPassword(auth, authForm.email, authForm.password);
+      const fUser = userCredential.user;
+      
+      const res = await fetch('/api/auth/firebase-sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email, password: authForm.password })
+        body: JSON.stringify({
+          uid: fUser.uid,
+          email: fUser.email
+        })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Identifiants invalides');
@@ -570,7 +616,25 @@ export default function App() {
       showSuccess(`Heureux de vous revoir, ${data.user.name} !`);
       await Promise.all([fetchSafeDocs(), fetchHistory()]);
     } catch (err: any) {
-      showError(err.message);
+      console.warn('Firebase login failed, attempting local DB fallback:', err);
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: authForm.email, password: authForm.password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Identifiants incorrects. Veuillez réessayer.');
+        
+        setUser(data.user);
+        setIsLoggedIn(true);
+        setCandidateName(data.user.name);
+        setCandidateEmail(data.user.email);
+        showSuccess(`Heureux de vous revoir, ${data.user.name} !`);
+        await Promise.all([fetchSafeDocs(), fetchHistory()]);
+      } catch (fallbackErr: any) {
+        showError(fallbackErr.message || err.message);
+      }
     }
   };
 
@@ -578,10 +642,19 @@ export default function App() {
     e.preventDefault();
     setErrorMsg(null);
     try {
-      const res = await fetch('/api/auth/signup', {
+      const { auth, createUserWithEmailAndPassword } = await import('./lib/firebase');
+      const userCredential = await createUserWithEmailAndPassword(auth, authForm.email, authForm.password);
+      const fUser = userCredential.user;
+
+      const res = await fetch('/api/auth/firebase-sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(authForm)
+        body: JSON.stringify({
+          uid: fUser.uid,
+          email: fUser.email,
+          name: authForm.name,
+          country: authForm.country
+        })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Échec de l'inscription");
@@ -593,12 +666,36 @@ export default function App() {
       showSuccess(`Votre compte Candia a été créé avec succès depuis le/la ${data.user.country} !`);
       await Promise.all([fetchSafeDocs(), fetchHistory()]);
     } catch (err: any) {
-      showError(err.message);
+      console.warn('Firebase signup failed, trying local DB signup:', err);
+      try {
+        const res = await fetch('/api/auth/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(authForm)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Échec de l'inscription");
+
+        setUser(data.user);
+        setIsLoggedIn(true);
+        setCandidateName(data.user.name);
+        setCandidateEmail(data.user.email);
+        showSuccess(`Votre compte Candia a été créé avec succès depuis le/la ${data.user.country} !`);
+        await Promise.all([fetchSafeDocs(), fetchHistory()]);
+      } catch (localErr: any) {
+        showError(localErr.message || err.message);
+      }
     }
   };
 
   const handleLogout = async () => {
     try {
+      try {
+        const { auth, signOut } = await import('./lib/firebase');
+        await signOut(auth);
+      } catch (e) {
+        console.warn('Firebase signout skipped or failed:', e);
+      }
       await fetch('/api/auth/logout', { method: 'POST' });
       setIsLoggedIn(false);
       setUser(null);
@@ -617,18 +714,26 @@ export default function App() {
     setErrorMsg(null);
     setResetSentInfo(null);
     try {
-      const res = await fetch('/api/auth/forgot-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Email introuvable");
-      
-      setResetSentInfo({ link: data.resetLink, expires: data.expiresIn });
-      showSuccess('Lien de réinitialisation sécurisé simulé généré !');
+      const { auth, sendPasswordResetEmail } = await import('./lib/firebase');
+      await sendPasswordResetEmail(auth, authForm.email);
+      showSuccess(`Lien de réinitialisation envoyé par Firebase à l'adresse ${authForm.email} !`);
+      setResetSentInfo({ link: '#', expires: '24 heures' });
     } catch (err: any) {
-      showError(err.message);
+      console.warn('Firebase forgot-password failed, trying local DB reset link generation:', err);
+      try {
+        const res = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: authForm.email })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Email introuvable");
+        
+        setResetSentInfo({ link: data.resetLink, expires: data.expiresIn });
+        showSuccess('Lien de réinitialisation sécurisé simulé généré !');
+      } catch (localErr: any) {
+        showError(localErr.message || err.message);
+      }
     }
   };
 
@@ -1270,28 +1375,42 @@ export default function App() {
                       <form onSubmit={handleLogin} className="space-y-4">
                         <div className="space-y-1">
                           <label className="text-xs text-slate-400 font-bold uppercase">Adresse Email</label>
-                          <input
-                            type="email"
-                            required
-                            value={authForm.email}
-                            onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
-                            placeholder="nom@exemple.com"
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-indigo-500 outline-none"
-                          />
+                          <div className="relative">
+                            <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                            <input
+                              type="email"
+                              required
+                              value={authForm.email}
+                              onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
+                              placeholder="nom@exemple.com"
+                              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 pl-10 text-sm text-white focus:border-indigo-500 outline-none"
+                            />
+                          </div>
                         </div>
                         <div className="space-y-1">
                           <label className="text-xs text-slate-400 font-bold uppercase flex justify-between">
                             <span>Mot de passe</span>
                             <button type="button" onClick={() => setAuthMode('forgot')} className="text-[10px] text-indigo-400 hover:underline">Mot de passe oublié ?</button>
                           </label>
-                          <input
-                            type="password"
-                            required
-                            value={authForm.password}
-                            onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
-                            placeholder="••••••••"
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-indigo-500 outline-none"
-                          />
+                          <div className="relative">
+                            <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                            <input
+                              type={showPassword ? "text" : "password"}
+                              required
+                              value={authForm.password}
+                              onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
+                              placeholder="••••••••"
+                              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 pl-10 pr-10 text-sm text-white focus:border-indigo-500 outline-none"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowPassword(!showPassword)}
+                              className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none cursor-pointer"
+                              aria-label={showPassword ? "Masquer le mot de passe" : "Afficher le mot de passe"}
+                            >
+                              {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
                         </div>
                         <div className="flex flex-col gap-3.5 pt-2">
                           <button
@@ -1299,6 +1418,20 @@ export default function App() {
                             className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-xl text-sm transition-all cursor-pointer shadow-sm shadow-indigo-600/20 text-center"
                           >
                             Se connecter
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={handleGoogleSignIn}
+                            className="bg-slate-950 hover:bg-slate-900 text-white font-bold py-3 px-4 rounded-xl text-sm transition-all cursor-pointer border border-slate-800 text-center flex items-center justify-center gap-2"
+                          >
+                            <svg className="w-4 h-4" viewBox="0 0 24 24">
+                              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l3.66-2.85z" />
+                              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.85c.87-2.6 3.3-4.53 6.16-4.53z" />
+                            </svg>
+                            Se connecter avec Google (Gmail)
                           </button>
                           
                           <div className="grid grid-cols-2 gap-3">
@@ -1362,59 +1495,93 @@ export default function App() {
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                           <div className="space-y-1">
                             <label className="text-xs text-slate-400 font-bold uppercase">Nom complet</label>
-                            <input
-                              type="text"
-                              required
-                              value={authForm.name}
-                              onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}
-                              placeholder="Amadou Diallo"
-                              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-indigo-500 outline-none"
-                            />
+                            <div className="relative">
+                              <Users className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                              <input
+                                type="text"
+                                required
+                                value={authForm.name}
+                                onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}
+                                placeholder="Amadou Diallo"
+                                className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 pl-10 text-sm text-white focus:border-indigo-500 outline-none"
+                              />
+                            </div>
                           </div>
                           <div className="space-y-1">
                             <label className="text-xs text-slate-400 font-bold uppercase">Pays de résidence</label>
-                            <select
-                              value={authForm.country}
-                              onChange={(e) => setAuthForm({ ...authForm, country: e.target.value })}
-                              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-indigo-500 outline-none"
-                            >
-                              <option value="Sénégal">Sénégal</option>
-                              <option value="Côte d'Ivoire">Côte d'Ivoire</option>
-                              <option value="Cameroun">Cameroun</option>
-                              <option value="Gabon">Gabon</option>
-                              <option value="Mali">Mali</option>
-                              <option value="Togo">Togo</option>
-                              <option value="Bénin">Bénin</option>
-                            </select>
+                            <div className="relative">
+                              <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                              <select
+                                value={authForm.country}
+                                onChange={(e) => setAuthForm({ ...authForm, country: e.target.value })}
+                                className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 pl-10 text-sm text-white focus:border-indigo-500 outline-none appearance-none cursor-pointer"
+                              >
+                                <option value="Sénégal">Sénégal</option>
+                                <option value="Côte d'Ivoire">Côte d'Ivoire</option>
+                                <option value="Cameroun">Cameroun</option>
+                                <option value="Gabon">Gabon</option>
+                                <option value="Mali">Mali</option>
+                                <option value="Togo">Togo</option>
+                                <option value="Bénin">Bénin</option>
+                              </select>
+                            </div>
                           </div>
                         </div>
                         <div className="space-y-1">
                           <label className="text-xs text-slate-400 font-bold uppercase">Adresse Email</label>
-                          <input
-                            type="email"
-                            required
-                            value={authForm.email}
-                            onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
-                            placeholder="amadou.diallo@gmail.com"
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-indigo-500 outline-none"
-                          />
+                          <div className="relative">
+                            <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                            <input
+                              type="email"
+                              required
+                              value={authForm.email}
+                              onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
+                              placeholder="amadou.diallo@gmail.com"
+                              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 pl-10 text-sm text-white focus:border-indigo-500 outline-none"
+                            />
+                          </div>
                         </div>
                         <div className="space-y-1">
                           <label className="text-xs text-slate-400 font-bold uppercase">Mot de passe de sécurité</label>
-                          <input
-                            type="password"
-                            required
-                            value={authForm.password}
-                            onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
-                            placeholder="Min. 6 caractères"
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-indigo-500 outline-none"
-                          />
+                          <div className="relative">
+                            <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                            <input
+                              type={showPassword ? "text" : "password"}
+                              required
+                              value={authForm.password}
+                              onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
+                              placeholder="Min. 6 caractères"
+                              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 pl-10 pr-10 text-sm text-white focus:border-indigo-500 outline-none"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowPassword(!showPassword)}
+                              className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none cursor-pointer"
+                              aria-label={showPassword ? "Masquer le mot de passe" : "Afficher le mot de passe"}
+                            >
+                              {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
                         </div>
-                        <button
+                         <button
                           type="submit"
                           className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3.5 px-4 rounded-xl text-sm transition-all cursor-pointer"
                         >
                           Créer mon compte de soumission
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleGoogleSignIn}
+                          className="w-full bg-slate-950 hover:bg-slate-900 text-white font-bold py-3 px-4 rounded-xl text-sm transition-all cursor-pointer border border-slate-800 text-center flex items-center justify-center gap-2"
+                        >
+                          <svg className="w-4 h-4" viewBox="0 0 24 24">
+                            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l3.66-2.85z" />
+                            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.85c.87-2.6 3.3-4.53 6.16-4.53z" />
+                          </svg>
+                          S'inscrire avec Google (Gmail)
                         </button>
                         <p className="text-xs text-slate-500 text-center">
                           Vous possédez déjà un compte ?{' '}
