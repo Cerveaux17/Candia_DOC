@@ -2197,26 +2197,33 @@ app.post('/api/payments/create-checkout', async (req, res) => {
     // Create a Checkout Session on FedaPay (Use sandbox-api.fedapay.com for sandbox and api.fedapay.com for live keys)
     const isLive = secretKey.startsWith('sk_live_') || secretKey.startsWith('pk_live_');
     const fedaPayBaseUrl = isLive ? 'https://api.fedapay.com' : 'https://sandbox-api.fedapay.com';
-    const fedaPayUrl = `${fedaPayBaseUrl}/v1/checkout_links`;
+    const fedaPayUrl = `${fedaPayBaseUrl}/v1/transactions`;
 
     const firstname = user.name ? user.name.split(' ')[0] : 'Candidat';
     const lastname = user.name ? user.name.split(' ').slice(1).join(' ') || 'Candia' : 'Candia';
 
     const bodyData = {
-      published: true,
-      transaction: {
-        amount: amountCFA,
-        currency: {
-          iso: 'XOF'
-        },
-        description: description || 'Paiement Candia',
-        customer: {
-          firstname: firstname,
-          lastname: lastname,
-          email: user.email
-        }
+      amount: amountCFA,
+      currency: {
+        iso: 'XOF'
       },
-      callback_url: `${appUrl}/api/payments/callback?dossierId=${dossierId || ''}&isSubscription=${isSubscription ? 'true' : 'false'}&userId=${user.id}`
+      description: description || 'Paiement Candia',
+      callback_url: `${appUrl}/api/payments/callback?dossierId=${dossierId || ''}&isSubscription=${isSubscription ? 'true' : 'false'}&userId=${user.id}`,
+      customer: {
+        firstname: firstname,
+        lastname: lastname,
+        email: user.email
+      },
+      custom_metadata: {
+        userId: user.id,
+        isSubscription: isSubscription ? 'true' : 'false',
+        dossierId: dossierId || ''
+      },
+      metadata: {
+        userId: user.id,
+        isSubscription: isSubscription ? 'true' : 'false',
+        dossierId: dossierId || ''
+      }
     };
 
     console.log('[FedaPay Request URL]:', fedaPayUrl);
@@ -2230,19 +2237,6 @@ app.post('/api/payments/create-checkout', async (req, res) => {
       },
       body: JSON.stringify(bodyData)
     });
-
-    if (response.status === 404) {
-      const fallbackUrl = `${fedaPayBaseUrl}/v1/checkouts`;
-      console.log(`[FedaPay] 404 on ${fedaPayUrl}. Retrying with fallback endpoint: ${fallbackUrl}`);
-      response = await fetch(fallbackUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${secretKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(bodyData)
-      });
-    }
 
     if (!response.ok) {
       let errorDetail = '';
@@ -2258,7 +2252,7 @@ app.post('/api/payments/create-checkout', async (req, res) => {
     }
 
     const data = await response.json();
-    const checkoutUrl = data?.checkout_link?.url || data?.checkout?.url || data?.['v1/checkout']?.url || data?.url;
+    const checkoutUrl = data?.transaction?.payment_url || data?.['v1/transaction']?.payment_url || data?.payment_url || data?.checkout_link?.url || data?.checkout?.url || data?.url;
 
     if (!checkoutUrl) {
       console.error('No checkout URL in FedaPay response:', data);
@@ -2293,6 +2287,239 @@ app.get('/api/payments/status', (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Create FedaPay checkout session via API (alternate route as requested by user)
+app.post('/api/create-payment', async (req, res) => {
+  try {
+    const { amountUSD, amount, description, isSubscription, dossierId, userId, email } = req.body;
+    const db = getDB();
+    
+    // Support either active session user or passed userId/email
+    let user = db.user;
+    if (userId) {
+      const found = db.users.find(u => u.id === userId);
+      if (found) user = found as any;
+    } else if (email) {
+      const found = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+      if (found) user = found as any;
+    }
+
+    if (!user) {
+      return res.status(401).json({ error: 'Utilisateur non identifié. Veuillez vous connecter ou spécifier un userId.' });
+    }
+
+    const secretKey = (process.env.FEDAPAY_SECRET_KEY || '').replace(/^["']|["']$/g, '').trim() || 'sk_sandbox_demo';
+    
+    // Support either amountUSD or amount (default to 2.5 USD)
+    const finalUSD = amountUSD || amount || 2.5;
+    const amountCFA = Math.round(finalUSD * 600);
+    const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+
+    // Mode simulation if secret key is demo
+    if (secretKey === 'sk_sandbox_demo' || secretKey.includes('demo')) {
+      console.log('[FedaPay SIMULATION] key is demo, generating simulated checkout URL in /api/create-payment');
+      const mockUrl = `${appUrl}/api/payments/callback?id=mock_txn_${Date.now()}&status=approved&dossierId=${dossierId || ''}&isSubscription=${isSubscription ? 'true' : 'false'}&userId=${user.id}`;
+      return res.json({ url: mockUrl, simulated: true });
+    }
+
+    // Create a Checkout Session on FedaPay
+    const isLive = secretKey.startsWith('sk_live_') || secretKey.startsWith('pk_live_');
+    const fedaPayBaseUrl = isLive ? 'https://api.fedapay.com' : 'https://sandbox-api.fedapay.com';
+    const fedaPayUrl = `${fedaPayBaseUrl}/v1/transactions`;
+
+    const firstname = user.name ? user.name.split(' ')[0] : 'Candidat';
+    const lastname = user.name ? user.name.split(' ').slice(1).join(' ') || 'Candia' : 'Candia';
+
+    const bodyData = {
+      amount: amountCFA,
+      currency: {
+        iso: 'XOF'
+      },
+      description: description || 'Paiement Candia FedaPay',
+      callback_url: `${appUrl}/api/payments/callback?dossierId=${dossierId || ''}&isSubscription=${isSubscription === true || isSubscription === 'true' ? 'true' : 'false'}&userId=${user.id}`,
+      customer: {
+        firstname: firstname,
+        lastname: lastname,
+        email: user.email
+      },
+      custom_metadata: {
+        userId: user.id,
+        isSubscription: isSubscription === true || isSubscription === 'true' ? 'true' : 'false',
+        dossierId: dossierId || ''
+      },
+      metadata: {
+        userId: user.id,
+        isSubscription: isSubscription === true || isSubscription === 'true' ? 'true' : 'false',
+        dossierId: dossierId || ''
+      }
+    };
+
+    console.log('[FedaPay Request URL]:', fedaPayUrl);
+    let response = await fetch(fedaPayUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${secretKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(bodyData)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.status(response.status).json({ error: `Erreur FedaPay (${response.status}) : ${errText}` });
+    }
+
+    const data = await response.json();
+    const checkoutUrl = data?.transaction?.payment_url || data?.['v1/transaction']?.payment_url || data?.payment_url || data?.checkout_link?.url || data?.checkout?.url || data?.url;
+
+    if (!checkoutUrl) {
+      return res.status(500).json({ error: 'L\'URL de paiement n\'a pas pu être générée par FedaPay.' });
+    }
+
+    res.json({ url: checkoutUrl, transaction_id: data?.transaction?.id || data?.['v1/transaction']?.id || data?.id });
+  } catch (error: any) {
+    console.error('Error in /api/create-payment:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Webhook FedaPay to receive real-time payment notifications (as requested by user)
+app.post('/api/fedapay-webhook', async (req, res) => {
+  console.log('🔔 FedaPay Webhook Received ! Headers:', JSON.stringify(req.headers));
+  console.log('🔔 FedaPay Webhook Body:', JSON.stringify(req.body, null, 2));
+
+  try {
+    const event = req.body?.event;
+    const entity = req.body?.entity;
+    
+    // Check if the event or entity indicates transaction.approved
+    if (event !== 'transaction.approved' && req.body?.status !== 'approved' && entity?.status !== 'approved') {
+      return res.status(200).json({ received: true, ignored: true, reason: `Ignored event: ${event || 'unknown'}` });
+    }
+
+    const transactionId = entity?.id || req.body?.id || entity?.transaction?.id || req.body?.entity_id;
+    if (!transactionId) {
+      return res.status(400).json({ error: 'Missing transaction ID in webhook payload.' });
+    }
+
+    const secretKey = (process.env.FEDAPAY_SECRET_KEY || '').replace(/^["']|["']$/g, '').trim() || 'sk_sandbox_demo';
+    const isLive = secretKey.startsWith('sk_live_') || secretKey.startsWith('pk_live_');
+    const fedaPayBaseUrl = isLive ? 'https://api.fedapay.com' : 'https://sandbox-api.fedapay.com';
+    const verifyUrl = `${fedaPayBaseUrl}/v1/transactions/${transactionId}`;
+
+    let isApproved = false;
+    let transactionDetails = null;
+
+    // Simulation / mock checks for easy testing
+    if (String(transactionId).startsWith('mock_txn_')) {
+      isApproved = true;
+      transactionDetails = {
+        id: transactionId,
+        status: 'approved',
+        custom_metadata: entity?.custom_metadata || entity?.metadata || req.body?.custom_metadata || req.body?.metadata || {}
+      };
+    } else {
+      // Secure Retrieve & Verify step to guarantee payment authenticity and prevent spoofing
+      console.log(`[Webhook] Verifying transaction ${transactionId} via FedaPay API...`);
+      const response = await fetch(verifyUrl, {
+        headers: {
+          'Authorization': `Bearer ${secretKey}`
+        }
+      });
+
+      if (!response.ok) {
+        console.error(`[Webhook Error] Failed to verify FedaPay transaction ${transactionId}:`, response.status);
+        return res.status(400).json({ error: 'Could not verify transaction with FedaPay' });
+      }
+
+      const data = await response.json();
+      transactionDetails = data?.transaction || data?.['v1/transaction'] || data;
+      isApproved = transactionDetails?.status === 'approved';
+    }
+
+    if (!isApproved) {
+      console.warn(`[Webhook] Transaction ${transactionId} is not approved yet. Status is ${transactionDetails?.status}`);
+      return res.status(200).json({ received: true, status: transactionDetails?.status, message: 'Transaction not approved' });
+    }
+
+    // Extract metadata to find user and payment intent
+    const meta = transactionDetails?.custom_metadata || transactionDetails?.metadata || entity?.custom_metadata || entity?.metadata || {};
+    const userId = meta.userId || req.body?.userId;
+    const isSubscription = meta.isSubscription === 'true' || meta.isSubscription === true || req.body?.isSubscription === 'true';
+    const dossierId = meta.dossierId || req.body?.dossierId;
+
+    if (!userId) {
+      console.error('[Webhook Error] No userId found in transaction metadata:', JSON.stringify(meta));
+      return res.status(400).json({ error: 'No userId associated with this transaction' });
+    }
+
+    console.log(`[Webhook Success] Verified approved transaction ${transactionId} for user ${userId}. Plan upgrade: ${isSubscription}, Dossier: ${dossierId}`);
+
+    const db = getDB();
+    const foundUser = db.users.find(u => u.id === userId);
+    
+    if (isSubscription) {
+      // Activate user's subscription
+      if (foundUser) {
+        foundUser.plan = 'pro';
+      }
+      if (db.user && db.user.id === userId) {
+        db.user.plan = 'pro';
+      }
+
+      logActivity(
+        userId,
+        foundUser?.email || db.user?.email || 'user@example.com',
+        'UPGRADE',
+        `[Webhook] Activation de la formule Mensuelle Pro via FedaPay - Trans ID: ${transactionId}`,
+        foundUser?.country || db.user?.country || 'Sénégal',
+        5.0
+      );
+
+      if (foundUser) {
+        saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+          console.error('Error syncing user subscription status to Firestore from Webhook:', err);
+        });
+      }
+    } else if (dossierId) {
+      // Unlock individual dossier
+      if (foundUser) {
+        if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+        if (!foundUser.unlockedDossiers.includes(dossierId)) {
+          foundUser.unlockedDossiers.push(dossierId);
+        }
+      }
+      if (db.user && db.user.id === userId) {
+        if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+        if (!db.user.unlockedDossiers.includes(dossierId)) {
+          db.user.unlockedDossiers.push(dossierId);
+        }
+      }
+
+      logActivity(
+        userId,
+        foundUser?.email || db.user?.email || 'user@example.com',
+        'UPGRADE',
+        `[Webhook] Déverrouillage du dossier ${dossierId} via FedaPay - Trans ID: ${transactionId}`,
+        foundUser?.country || db.user?.country || 'Sénégal',
+        2.5
+      );
+
+      if (foundUser) {
+        saveEntityToFirestore('users', foundUser.id, foundUser).catch(err => {
+          console.error('Error syncing unlocked dossier status to Firestore from Webhook:', err);
+        });
+      }
+    }
+
+    saveDB(db);
+    return res.status(200).json({ success: true, message: 'Subscription/benefit successfully activated via Webhook' });
+  } catch (error: any) {
+    console.error('[Webhook Critical Error]:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 
 // FedaPay payment completion callback
 app.get('/api/payments/callback', async (req, res) => {
