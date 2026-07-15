@@ -161,3 +161,32 @@ export async function deleteEntityFromFirestore(collectionName: string, id: stri
     console.error(`❌ Error deleting ${collectionName}/${id} from Firestore:`, error);
   }
 }
+
+/**
+ * Purge mock/fictional data from Firestore
+ */
+export async function purgeMockDataFromFirestore(): Promise<void> {
+  if (!db) return;
+  try {
+    console.log('🧹 Purging mock data from Cloud Firestore...');
+    const mockUsers = ['user_default', 'user_1', 'user_2', 'user_3', 'user_4', 'user_5', 'user_6', 'user_7'];
+    for (const uid of mockUsers) {
+      await db.collection('users').doc(uid).delete();
+    }
+    
+    const mockDossiers = ['dossier_1'];
+    for (const did of mockDossiers) {
+      await db.collection('dossiers').doc(did).delete();
+    }
+
+    const mockLogs = ['log_1', 'log_2', 'log_3', 'log_4', 'log_5', 'log_6', 'log_7'];
+    for (const lid of mockLogs) {
+      await db.collection('activityLogs').doc(lid).delete();
+    }
+    
+    console.log('✅ Cleaned mock entries from Firestore collections.');
+  } catch (error) {
+    console.error('❌ Error purging mock data from Firestore:', error);
+  }
+}
+

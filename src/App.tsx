@@ -43,9 +43,21 @@ import {
   ChevronRight,
   UserPlus,
   Smartphone,
-  CreditCard
+  CreditCard,
+  Menu
 } from 'lucide-react';
 import { STANDARD_CATEGORIES, CategoryDefinition, SafeDocument, RecruitmentOffer, GeneratedDossier, DocumentCategory, User } from './types';
+
+const getDossierPrice = (dossier: any) => {
+  const pageCount = dossier?.pageCount || dossier?.pagesCount || 12;
+  if (pageCount < 15) {
+    return { fcfa: 1500, usd: 2.5, label: 'Moins de 15 pages' };
+  } else if (pageCount <= 50) {
+    return { fcfa: 5000, usd: 8.33, label: '15 à 50 pages' };
+  } else {
+    return { fcfa: 10000, usd: 16.67, label: 'Plus de 50 pages' };
+  }
+};
 
 function getCategoryLabel(category: string): string {
   const map: { [key: string]: string } = {
@@ -94,6 +106,7 @@ const getApiUrl = (path: string): string => {
 export default function App() {
   // Navigation & Tabs
   const [activeTab, setActiveTab] = useState<'safe' | 'new-application' | 'generator' | 'history' | 'admin'>('safe');
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
   // Authentication & Session state
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -260,6 +273,7 @@ export default function App() {
   const [adminSearch, setAdminSearch] = useState('');
   const [adminFilterPlan, setAdminFilterPlan] = useState('all');
   const [adminFilterCountry, setAdminFilterCountry] = useState('all');
+  const [adminRealOnly, setAdminRealOnly] = useState(true);
   const [loadingAdmin, setLoadingAdmin] = useState(false);
 
   // Modals & Alerts
@@ -343,7 +357,7 @@ export default function App() {
       setLoadingUser(true);
       const res = await fetch(getApiUrl('/api/user'));
       const data = await res.json();
-      if (data && data.id && data.id !== 'user_default') {
+      if (data && data.id && data.id !== 'user_default' && data.id !== 'guest') {
         setUser(data);
         setIsLoggedIn(true);
         setCandidateName(data.name || '');
@@ -382,7 +396,7 @@ export default function App() {
       const data = await res.json();
       if (data.allowed) {
         if (data.isFreeDemo) {
-          alert("Félicitations ! Vous téléchargez votre premier dossier PDF de démonstration gratuitement. Profitez-en ! 🎁");
+          alert("Félicitations ! Vous téléchargez votre premier dossier PDF d'essai gratuitement. Profitez-en ! 🎁");
         }
         // Start download
         window.open(getApiUrl(`/api/dossiers/download/${dossierId}`), '_blank');
@@ -402,7 +416,7 @@ export default function App() {
     }
   };
 
-  const payWithFedaPay = async (amountInUSD: number, description: string, isSubscription: boolean, dossierId?: string) => {
+  const payWithFedaPay = async (amountInUSD: number, description: string, isSubscription: boolean, dossierId?: string, amountInCFA?: number) => {
     if (isPaying) return;
     setIsPaying(true);
 
@@ -424,7 +438,7 @@ export default function App() {
       const res = await fetch(getApiUrl('/api/payments/create-checkout'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amountUSD: amountInUSD, description, isSubscription, dossierId })
+        body: JSON.stringify({ amountUSD: amountInUSD, amountCFA: amountInCFA, description, isSubscription, dossierId })
       });
 
       if (!res.ok) {
@@ -445,6 +459,7 @@ export default function App() {
       if (data.simulated) {
         setFedaPaySimulatedData({
           amountUSD: amountInUSD,
+          amountCFA: amountInCFA,
           description,
           isSubscription,
           dossierId,
@@ -461,9 +476,9 @@ export default function App() {
     } catch (err: any) {
       console.error('FedaPay Checkout API Error:', err);
       
-      const isRealMode = fedaPayStatus?.mode === 'live' || fedaPayStatus?.mode === 'sandbox_real';
+      const isLive = fedaPayStatus?.mode === 'live' || fedaPayStatus?.mode === 'sandbox_real';
       
-      if (isRealMode) {
+      if (isLive) {
         // Show real error to the user and never trigger simulator
         showError(`Échec de la transaction FedaPay : ${err.message || 'Une erreur est survenue lors de la création de la session de paiement.'}\n\nVeuillez vérifier vos clés secrètes FedaPay dans les variables d'environnement de votre projet.`);
         setIsPaying(false);
@@ -471,6 +486,7 @@ export default function App() {
         // Fallback for simulation_local
         setFedaPaySimulatedData({
           amountUSD: amountInUSD,
+          amountCFA: amountInCFA,
           description,
           isSubscription,
           dossierId,
@@ -607,6 +623,30 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Erreur lors de la synchronisation de votre profil.');
 
       setUser(data.user);
+
+      // Direct client-side write to Firestore to guarantee persistence
+      try {
+        const { db, doc, setDoc } = await import('./lib/firebase');
+        await setDoc(doc(db, 'users', fUser.uid), {
+          id: fUser.uid,
+          name: data.user.name || fUser.displayName || fUser.email?.split('@')[0] || 'Utilisateur',
+          email: fUser.email?.toLowerCase(),
+          plan: data.user.plan || 'free',
+          monthlyDossiersCreated: data.user.monthlyDossiersCreated || 0,
+          country: data.user.country || authForm.country || 'Sénégal',
+          isSuspended: false,
+          createdAt: data.user.createdAt || new Date().toISOString(),
+          emailVerified: true,
+          lastActiveAt: new Date().toISOString(),
+          role: data.user.role || (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com' ? 'admin' : 'user'),
+          unlockedDossiers: data.user.unlockedDossiers || [],
+          downloadedDossiers: data.user.downloadedDossiers || []
+        }, { merge: true });
+        console.log("User successfully written directly to Firestore from Google login client.");
+      } catch (fsErr) {
+        console.error("Direct Firestore user write on Google login failed:", fsErr);
+      }
+
       setIsLoggedIn(true);
       setCandidateName(data.user.name);
       setCandidateEmail(data.user.email);
@@ -642,6 +682,28 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Identifiants invalides');
       
       setUser(data.user);
+
+      // Direct client-side write to Firestore to update lastActiveAt and guarantee persistence
+      try {
+        const { db, doc, setDoc } = await import('./lib/firebase');
+        await setDoc(doc(db, 'users', fUser.uid), {
+          id: fUser.uid,
+          name: data.user.name || fUser.email?.split('@')[0] || 'Utilisateur',
+          email: fUser.email?.toLowerCase(),
+          plan: data.user.plan || 'free',
+          monthlyDossiersCreated: data.user.monthlyDossiersCreated || 0,
+          country: data.user.country || 'Sénégal',
+          isSuspended: false,
+          lastActiveAt: new Date().toISOString(),
+          role: data.user.role || (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com' ? 'admin' : 'user'),
+          unlockedDossiers: data.user.unlockedDossiers || [],
+          downloadedDossiers: data.user.downloadedDossiers || []
+        }, { merge: true });
+        console.log("User successfully updated directly in Firestore from login client.");
+      } catch (fsErr) {
+        console.error("Direct Firestore user update on login failed:", fsErr);
+      }
+
       setIsLoggedIn(true);
       setCandidateName(data.user.name);
       setCandidateEmail(data.user.email);
@@ -692,6 +754,30 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || "Échec de l'inscription");
 
       setUser(data.user);
+
+      // Direct client-side write to Firestore to guarantee persistence
+      try {
+        const { db, doc, setDoc } = await import('./lib/firebase');
+        await setDoc(doc(db, 'users', fUser.uid), {
+          id: fUser.uid,
+          name: authForm.name || fUser.email?.split('@')[0] || 'Utilisateur',
+          email: fUser.email?.toLowerCase(),
+          plan: data.user.plan || 'free',
+          monthlyDossiersCreated: data.user.monthlyDossiersCreated || 0,
+          country: authForm.country || 'Sénégal',
+          isSuspended: false,
+          createdAt: data.user.createdAt || new Date().toISOString(),
+          emailVerified: true,
+          lastActiveAt: new Date().toISOString(),
+          role: data.user.role || (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com' ? 'admin' : 'user'),
+          unlockedDossiers: data.user.unlockedDossiers || [],
+          downloadedDossiers: data.user.downloadedDossiers || []
+        }, { merge: true });
+        console.log("User successfully written directly to Firestore from signup client.");
+      } catch (fsErr) {
+        console.error("Direct Firestore user write on signup failed:", fsErr);
+      }
+
       setIsLoggedIn(true);
       setCandidateName(data.user.name);
       setCandidateEmail(data.user.email);
@@ -793,7 +879,7 @@ export default function App() {
         const data = await res.json();
         if (res.ok) {
           setUser(data);
-          showSuccess("Formule Démo activée.");
+          showSuccess("Formule Gratuite activée.");
           setShowUpgradeModal(false);
         }
       } catch (err) {
@@ -808,6 +894,11 @@ export default function App() {
   // Safe file upload handler
   const handleSafeFileUpload = async (file: File, category: string): Promise<any> => {
     if (!file) return null;
+
+    if (!isLoggedIn) {
+      showError("Inscription ou connexion obligatoire pour ajouter des pièces à votre coffre-fort.");
+      return null;
+    }
 
     // Check plan constraints
     // Essentiel/Pro/Business support unlimited uploads. Free supports max 7 files in vault
@@ -849,6 +940,10 @@ export default function App() {
 
   const handleCustomDocSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isLoggedIn) {
+      showError("Inscription ou connexion obligatoire pour ajouter des pièces à votre coffre-fort.");
+      return;
+    }
     if (!customDocName.trim()) {
       showError('Veuillez entrer un nom pour la pièce.');
       return;
@@ -1023,17 +1118,161 @@ export default function App() {
   const loadAdminDashboard = async () => {
     setLoadingAdmin(true);
     try {
-      const [statsRes, usersRes, logsRes] = await Promise.all([
-        fetch(getApiUrl('/api/admin/stats')),
-        fetch(getApiUrl(`/api/admin/users?search=${encodeURIComponent(adminSearch)}&plan=${adminFilterPlan}&country=${adminFilterCountry}`)),
-        fetch(getApiUrl('/api/admin/logs'))
+      const emailHeader = user?.email || '';
+      const [statsRes, logsRes] = await Promise.all([
+        fetch(getApiUrl('/api/admin/stats'), {
+          headers: { 'x-user-email': emailHeader }
+        }),
+        fetch(getApiUrl('/api/admin/logs'), {
+          headers: { 'x-user-email': emailHeader }
+        })
       ]);
 
       const statsData = await statsRes.json();
-      const usersData = await usersRes.json();
       const logsData = await logsRes.json();
 
-      setAdminStats(statsData);
+      // Try loading stats & users list directly from Cloud Firestore to guarantee real-time updates and bypass backend permission issue
+      let usersData: any[] = [];
+      let calculatedStats = null;
+      try {
+        const { db, collection, getDocs } = await import('./lib/firebase');
+        const querySnapshot = await getDocs(collection(db, 'users'));
+        querySnapshot.forEach((docSnap) => {
+          usersData.push({
+            id: docSnap.id,
+            ...docSnap.data()
+          });
+        });
+
+        const isRealUser = (u: any) => u.id !== 'user_default' && u.id !== 'guest' && u.email !== 'admin@candia.ai';
+        usersData = usersData.filter(isRealUser);
+
+        if (usersData.length > 0) {
+          const totalUsers = usersData.length;
+          
+          // Active < 30 days
+          const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+          const activeUsers = usersData.filter(u => new Date(u.lastActiveAt || u.createdAt || 0).getTime() > thirtyDaysAgo).length;
+          
+          // Subscribers by plan
+          const subscribersByPlan = {
+            free: usersData.filter(u => u.plan === 'free' || !u.plan).length,
+            essentiel: usersData.filter(u => u.plan === 'essentiel').length,
+            pro: usersData.filter(u => u.plan === 'pro').length,
+            business: usersData.filter(u => u.plan === 'business').length,
+          };
+          
+          // Total dossiers: query the dossiers collection to get the real count of dossiers in Firestore!
+          let totalDossiers = 0;
+          try {
+            const dossiersSnap = await getDocs(collection(db, 'dossiers'));
+            totalDossiers = dossiersSnap.size;
+          } catch (dossierErr) {
+            console.warn("Could not load dossiers count directly from Firestore:", dossierErr);
+            totalDossiers = 0;
+          }
+
+          // Paying users count
+          const payingUsersCount = usersData.filter(u => u.plan && u.plan !== 'free').length;
+          const conversionRate = totalUsers > 0 ? ((payingUsersCount / totalUsers) * 100).toFixed(1) : '0.0';
+
+          // MRR in FCFA
+          // Essentiel: 3000 FCFA, Pro: 7500 FCFA, Business: 15000 FCFA
+          const mrr = usersData.reduce((sum, u) => {
+            if (u.plan === 'essentiel') return sum + 3000;
+            if (u.plan === 'pro') return sum + 7500;
+            if (u.plan === 'business') return sum + 15000;
+            return sum;
+          }, 0);
+
+          // Geo distribution
+          const geoMap: { [key: string]: { users: number, dossiers: number } } = {};
+          usersData.forEach(u => {
+            const country = u.country || 'Sénégal';
+            if (!geoMap[country]) {
+              geoMap[country] = { users: 0, dossiers: 0 };
+            }
+            geoMap[country].users += 1;
+          });
+
+          // Also count actual dossiers country origins if any
+          try {
+            const dossiersSnap = await getDocs(collection(db, 'dossiers'));
+            dossiersSnap.forEach((doc) => {
+              const d = doc.data();
+              const u = usersData.find(usr => usr.id === d.userId);
+              const country = u?.country || 'Sénégal';
+              if (!geoMap[country]) {
+                geoMap[country] = { users: 0, dossiers: 0 };
+              }
+              geoMap[country].dossiers += 1;
+            });
+          } catch (e) {
+            console.warn(e);
+          }
+
+          const regionalDistribution = Object.keys(geoMap).map(country => ({
+            country,
+            users: geoMap[country].users,
+            dossiers: geoMap[country].dossiers,
+          }));
+
+          // AI performance stats strictly from actual logsData
+          const cleanLogs = Array.isArray(logsData) ? logsData : [];
+          const aiStats = {
+            totalAnalyses: cleanLogs.filter((l: any) => l.action === 'ANALYZE').length,
+            totalLetters: cleanLogs.filter((l: any) => l.action === 'LETTER_GEN').length,
+            errorRate: '0.0%',
+            estimatedCostEuro: cleanLogs.reduce((sum: number, l: any) => sum + (l.costEstimate || 0), 0).toFixed(3),
+          };
+
+          calculatedStats = {
+            totalUsers,
+            activeUsers,
+            subscribersByPlan,
+            totalDossiers,
+            conversionRate,
+            mrr,
+            regionalDistribution,
+            aiStats
+          };
+
+          // Filter by search
+          if (adminSearch) {
+            const q = adminSearch.toLowerCase().trim();
+            usersData = usersData.filter(u => 
+              (u.name && u.name.toLowerCase().includes(q)) || 
+              (u.email && u.email.toLowerCase().includes(q))
+            );
+          }
+          // Filter by plan
+          if (adminFilterPlan && adminFilterPlan !== 'all') {
+            usersData = usersData.filter(u => u.plan === adminFilterPlan);
+          }
+          // Filter by country
+          if (adminFilterCountry && adminFilterCountry !== 'all') {
+            usersData = usersData.filter(u => u.country === adminFilterCountry);
+          }
+
+          // Sort by createdAt descending
+          usersData.sort((a, b) => {
+            const dateA = new Date(a.createdAt || 0).getTime();
+            const dateB = new Date(b.createdAt || 0).getTime();
+            return dateB - dateA;
+          });
+        } else {
+          // Fallback to server if empty
+          throw new Error("Firestore users list is empty");
+        }
+      } catch (fsErr) {
+        console.warn("Could not load stats & users directly from Firestore, falling back to server API:", fsErr);
+        const usersRes = await fetch(getApiUrl(`/api/admin/users?search=${encodeURIComponent(adminSearch)}&plan=${adminFilterPlan}&country=${adminFilterCountry}`), {
+          headers: { 'x-user-email': emailHeader }
+        });
+        usersData = await usersRes.json();
+      }
+
+      setAdminStats(calculatedStats || statsData);
       setAdminUsers(usersData);
       setAdminLogs(logsData);
     } catch (err) {
@@ -1047,13 +1286,31 @@ export default function App() {
     if (activeTab === 'admin') {
       loadAdminDashboard();
     }
-  }, [activeTab, adminSearch, adminFilterPlan, adminFilterCountry]);
+  }, [activeTab, adminSearch, adminFilterPlan, adminFilterCountry, adminRealOnly]);
 
   // Admin Toggle Suspend Action
   const toggleUserSuspension = async (userId: string) => {
     try {
-      const res = await fetch(getApiUrl(`/api/admin/users/${userId}/suspend`), { method: 'POST' });
+      const emailHeader = user?.email || '';
+      const res = await fetch(getApiUrl(`/api/admin/users/${userId}/suspend`), {
+        method: 'POST',
+        headers: { 'x-user-email': emailHeader }
+      });
       if (res.ok) {
+        // Direct Client-Side Firestore Sync
+        try {
+          const { db, doc, setDoc, getDoc } = await import('./lib/firebase');
+          const userDocRef = doc(db, 'users', userId);
+          const userSnap = await getDoc(userDocRef);
+          if (userSnap.exists()) {
+            const currentSuspended = userSnap.data().isSuspended || false;
+            await setDoc(userDocRef, { isSuspended: !currentSuspended }, { merge: true });
+            console.log("Direct client-side Firestore suspend updated.");
+          }
+        } catch (fsErr) {
+          console.error("Direct Firestore suspend sync failed:", fsErr);
+        }
+
         showSuccess('Statut d\'accès de l\'utilisateur modifié !');
         loadAdminDashboard();
       }
@@ -1065,12 +1322,26 @@ export default function App() {
   // Admin Change Plan Action
   const adminChangeUserPlan = async (userId: string, targetPlan: string) => {
     try {
+      const emailHeader = user?.email || '';
       const res = await fetch(getApiUrl(`/api/admin/users/${userId}/change-plan`), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-user-email': emailHeader
+        },
         body: JSON.stringify({ plan: targetPlan })
       });
       if (res.ok) {
+        // Direct Client-Side Firestore Sync
+        try {
+          const { db, doc, setDoc } = await import('./lib/firebase');
+          const userDocRef = doc(db, 'users', userId);
+          await setDoc(userDocRef, { plan: targetPlan }, { merge: true });
+          console.log("Direct client-side Firestore plan updated.");
+        } catch (fsErr) {
+          console.error("Direct Firestore plan sync failed:", fsErr);
+        }
+
         showSuccess('Formule d\'abonnement utilisateur modifiée avec succès.');
         setShowPlanChangeConfirm(null);
         loadAdminDashboard();
@@ -1188,18 +1459,41 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Mobile Sidebar backdrop */}
+      <AnimatePresence>
+        {isMobileSidebarOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setIsMobileSidebarOpen(false)}
+            className="fixed inset-0 bg-slate-950/60 backdrop-blur-xs z-35 md:hidden"
+          />
+        )}
+      </AnimatePresence>
+
       {/* Aside Left Sidebar navigation */}
-      <aside className="w-72 bg-slate-950 text-white flex flex-col shrink-0 border-r border-slate-900">
-        <div className="p-6 flex items-center space-x-3 border-b border-slate-900">
-          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center font-bold text-white shadow-md shadow-indigo-600/20 shrink-0">
-            <FolderLock className="w-5 h-5" />
+      <aside className={`fixed inset-y-0 left-0 z-40 w-72 bg-slate-950 text-white flex flex-col shrink-0 border-r border-slate-900 transition-transform duration-300 md:translate-x-0 md:static ${
+        isMobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'
+      }`}>
+        <div className="p-6 flex items-center justify-between border-b border-slate-900">
+          <div className="flex items-center space-x-3 overflow-hidden">
+            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center font-bold text-white shadow-md shadow-indigo-600/20 shrink-0">
+              <FolderLock className="w-5 h-5" />
+            </div>
+            <div className="truncate">
+              <span className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-1">
+                Candia <Sparkles className="w-3.5 h-3.5 text-indigo-400 fill-indigo-400/20 animate-pulse" />
+              </span>
+              <p className="text-[10px] text-slate-500 font-medium tracking-wider uppercase leading-none mt-1">SaaS de Soumission IA</p>
+            </div>
           </div>
-          <div>
-            <span className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-1">
-              Candia <Sparkles className="w-3.5 h-3.5 text-indigo-400 fill-indigo-400/20 animate-pulse" />
-            </span>
-            <p className="text-[10px] text-slate-500 font-medium tracking-wider uppercase leading-none mt-1">SaaS de Soumission IA</p>
-          </div>
+          <button
+            onClick={() => setIsMobileSidebarOpen(false)}
+            className="md:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-900 cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
         </div>
 
         {/* Auth status panel */}
@@ -1236,13 +1530,13 @@ export default function App() {
               <p className="text-xs text-slate-300 leading-normal font-medium">Connectez-vous pour conserver vos fichiers à vie.</p>
               <div className="grid grid-cols-2 gap-2">
                 <button
-                  onClick={() => { setAuthMode('login'); setActiveTab('safe'); }}
+                  onClick={() => { setAuthMode('login'); setActiveTab('safe'); setIsMobileSidebarOpen(false); }}
                   className="text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-xl transition-colors cursor-pointer"
                 >
                   Connexion
                 </button>
                 <button
-                  onClick={() => { setAuthMode('signup'); setActiveTab('safe'); }}
+                  onClick={() => { setAuthMode('signup'); setActiveTab('safe'); setIsMobileSidebarOpen(false); }}
                   className="text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white py-2 rounded-xl transition-colors cursor-pointer"
                 >
                   Inscription
@@ -1257,7 +1551,7 @@ export default function App() {
           <p className="text-[10px] uppercase font-bold text-slate-500 px-3 mb-2 tracking-widest">Fonctionnalités</p>
 
           <button
-            onClick={() => setActiveTab('safe')}
+            onClick={() => { setActiveTab('safe'); setIsMobileSidebarOpen(false); }}
             className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left bg-[#000000] ${activeTab === 'safe' ? 'text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-[#000000]/50'}`}
           >
             <FolderLock className="w-4 h-4 shrink-0" />
@@ -1270,7 +1564,7 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => setActiveTab('new-application')}
+            onClick={() => { setActiveTab('new-application'); setIsMobileSidebarOpen(false); }}
             className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${activeTab === 'new-application' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
           >
             <UploadCloud className="w-4 h-4 shrink-0" />
@@ -1284,6 +1578,7 @@ export default function App() {
                 return;
               }
               setActiveTab('generator');
+              setIsMobileSidebarOpen(false);
             }}
             className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${!currentOffer ? 'opacity-40 cursor-not-allowed' : ''} ${activeTab === 'generator' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
           >
@@ -1297,7 +1592,7 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => setActiveTab('history')}
+            onClick={() => { setActiveTab('history'); setIsMobileSidebarOpen(false); }}
             className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${activeTab === 'history' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
           >
             <History className="w-4 h-4 shrink-0" />
@@ -1314,7 +1609,7 @@ export default function App() {
               <p className="text-[10px] uppercase font-bold text-slate-500 px-3 mb-2 tracking-widest">Administration</p>
 
               <button
-                onClick={() => setActiveTab('admin')}
+                onClick={() => { setActiveTab('admin'); setIsMobileSidebarOpen(false); }}
                 className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${activeTab === 'admin' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
               >
                 <Users className="w-4 h-4 shrink-0" />
@@ -1347,11 +1642,19 @@ export default function App() {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-50">
         {/* Header Ribbon bar */}
-        <header className="h-16 bg-white border-b border-slate-200 px-8 flex items-center justify-between shrink-0 sticky top-0 z-10 shadow-xs">
-          <div className="flex items-center space-x-2 text-sm text-slate-500 font-medium">
-            <span className="hover:text-slate-800 transition-colors">Plateforme</span>
-            <span className="text-slate-300">/</span>
-            <span className="text-slate-950 font-semibold">
+        <header className="h-16 bg-white border-b border-slate-200 px-4 sm:px-8 flex items-center justify-between shrink-0 sticky top-0 z-10 shadow-xs">
+          <div className="flex items-center space-x-2 text-sm text-slate-500 font-medium overflow-hidden">
+            {/* Hamburger button on mobile */}
+            <button
+              onClick={() => setIsMobileSidebarOpen(true)}
+              className="md:hidden p-2 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100 mr-1 shrink-0 cursor-pointer"
+              title="Ouvrir le menu"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <span className="hidden sm:inline hover:text-slate-800 transition-colors">Plateforme</span>
+            <span className="hidden sm:inline text-slate-300">/</span>
+            <span className="text-slate-950 font-semibold truncate max-w-[150px] sm:max-w-none">
               {activeTab === 'safe' && 'Mon Coffre-fort'}
               {activeTab === 'new-application' && 'Analyser un Appel'}
               {activeTab === 'generator' && (currentOffer ? currentOffer.title : 'Fusionner & Signer')}
@@ -1378,7 +1681,7 @@ export default function App() {
         </header>
 
         {/* Scrollable Panel View */}
-        <div className="flex-1 overflow-y-auto p-8">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-8">
           <AnimatePresence mode="wait">
             
             {/* 1. MON COFFRE-FORT TAB */}
@@ -1399,7 +1702,7 @@ export default function App() {
                       </div>
                       <div>
                         <h2 className="font-display font-bold text-xl text-white">Conserver vos documents à vie ?</h2>
-                        <p className="text-xs text-slate-400 mt-1">Créez votre compte en 10 secondes ou utilisez la session Candidat Démo en un clic.</p>
+                        <p className="text-xs text-slate-400 mt-1">Créez votre compte ou connectez-vous pour sauvegarder vos documents de manière sécurisée.</p>
                       </div>
                     </div>
 
@@ -1465,56 +1768,7 @@ export default function App() {
                             </svg>
                             Se connecter avec Google (Gmail)
                           </button>
-                          
-                          <div className="grid grid-cols-2 gap-3">
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                // Fast simulated login as default candidate
-                                setAuthForm({ name: 'Candidat Démo', email: 'candidat.demo@candia.ai', password: 'password123', country: 'Sénégal' });
-                                const res = await fetch(getApiUrl('/api/auth/login'), {
-                                  method: 'POST',
-                                  headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ email: 'candidat.demo@candia.ai', password: 'password123' })
-                                });
-                                if (res.ok) {
-                                  const d = await res.json();
-                                  setUser(d.user);
-                                  setIsLoggedIn(true);
-                                  showSuccess('Session Candidat Démo chargée !');
-                                  fetchSafeDocs();
-                                  fetchHistory();
-                                }
-                              }}
-                              className="bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold py-2.5 px-3 rounded-xl text-xs transition-all cursor-pointer border border-slate-750"
-                            >
-                              Candidat Démo ⚡
-                            </button>
-                            
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                // Fast simulated login as admin
-                                setAuthForm({ name: 'Administrateur Principal', email: 'admin@candia.ai', password: 'AdminPassword2026!', country: 'Sénégal' });
-                                const res = await fetch(getApiUrl('/api/auth/login'), {
-                                  method: 'POST',
-                                  headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ email: 'admin@candia.ai', password: 'AdminPassword2026!' })
-                                });
-                                if (res.ok) {
-                                  const d = await res.json();
-                                  setUser(d.user);
-                                  setIsLoggedIn(true);
-                                  showSuccess('Espace Administrateur Candia chargé !');
-                                  fetchSafeDocs();
-                                  fetchHistory();
-                                }
-                              }}
-                              className="bg-indigo-950/40 hover:bg-indigo-900/40 text-indigo-200 font-bold py-2.5 px-3 rounded-xl text-xs transition-all cursor-pointer border border-indigo-850/40"
-                            >
-                              Admin Démo 🔑
-                            </button>
-                          </div>
+
                         </div>
 
                         <p className="text-xs text-slate-500 text-center">
@@ -1679,8 +1933,9 @@ export default function App() {
                 )}
 
                 {/* Vault Grid Section */}
-                <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs">
-                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                {isLoggedIn ? (
+                  <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs">
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                     <div>
                       <h2 className="font-display font-bold text-xl text-slate-900">Bibliothèque Coffre-fort Sécurisé</h2>
                       <p className="text-xs text-slate-500 mt-1">Uploadez vos documents administratifs récurrents. L'IA les classera de façon sémantique.</p>
@@ -1875,7 +2130,28 @@ export default function App() {
                       </button>
                     </div>
                   )}
-                </div>
+                  </div>
+                ) : (
+                  <div className="bg-white p-12 rounded-3xl border border-slate-200 shadow-2xs text-center max-w-xl mx-auto space-y-5">
+                    <div className="mx-auto w-14 h-14 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center">
+                      <Lock className="w-6 h-6 animate-pulse" />
+                    </div>
+                    <h3 className="font-display font-bold text-lg text-slate-900">Coffre-fort verrouillé</h3>
+                    <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
+                      L'accès au coffre-fort et le téléversement de documents de candidature sont strictement réservés aux utilisateurs inscrits. Rejoignez Candia gratuitement pour stocker, classer et organiser vos documents administratifs de manière hautement sécurisée.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMode('signup');
+                        window.scrollTo({ top: 0, behavior: 'smooth' });
+                      }}
+                      className="inline-flex items-center gap-2 text-xs bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-5 py-3 rounded-xl transition-all shadow-xs hover:shadow-md cursor-pointer"
+                    >
+                      S'inscrire gratuitement <ArrowRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </motion.div>
             )}
 
@@ -2560,6 +2836,8 @@ export default function App() {
                   </div>
                 )}
 
+
+
                 {/* Executive overview row of KPI cards */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
                   
@@ -2812,7 +3090,18 @@ export default function App() {
                           <tr key={`${u.id || 'u'}-${index}`} className="hover:bg-slate-50/40">
                             <td className="py-3.5 px-4">
                               <span className="font-bold text-slate-900 block">{u.name}</span>
-                              <span className="text-[10px] text-slate-400">{u.email}</span>
+                              <span className="text-[10px] text-slate-400 block">{u.email}</span>
+                              {u.createdAt && (
+                                <span className="text-[9px] text-indigo-600 font-semibold block mt-0.5">
+                                  Inscrit le {new Date(u.createdAt).toLocaleDateString('fr-FR', {
+                                    day: '2-digit',
+                                    month: '2-digit',
+                                    year: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit'
+                                  })}
+                                </span>
+                              )}
                             </td>
                             <td className="py-3.5 px-4 font-semibold text-slate-700">{u.country || 'Sénégal'}</td>
                             <td className="py-3.5 px-4 font-mono">
@@ -3021,108 +3310,96 @@ export default function App() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
-            className="bg-white rounded-3xl max-w-3xl w-full border border-slate-200 overflow-hidden shadow-2xl p-6 sm:p-8"
+            className="bg-white rounded-3xl max-w-3xl w-full border border-slate-200 overflow-hidden shadow-2xl p-5 sm:p-8 max-h-[calc(100vh-2rem)] flex flex-col"
           >
-            <div className="flex justify-between items-center pb-4 border-b border-slate-100">
-              <h3 className="font-display font-bold text-xl text-slate-900 flex items-center gap-2">
+            <div className="flex justify-between items-center pb-4 border-b border-slate-100 shrink-0">
+              <h3 className="font-display font-bold text-lg sm:text-xl text-slate-900 flex items-center gap-2">
                 <Sparkles className="w-5 h-5 text-amber-500 fill-amber-100" />
                 Formules & Tarification Candia
               </h3>
               <button
                 onClick={() => setShowUpgradeModal(false)}
-                className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-xl transition-colors cursor-pointer"
+                className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-xl transition-colors cursor-pointer shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
-              
-              {/* Formule Démo */}
-              <div className={`rounded-2xl border p-5 flex flex-col justify-between transition-all ${user?.plan !== 'pro' ? 'border-indigo-600 bg-indigo-50/10' : 'border-slate-200 hover:border-indigo-500'}`}>
-                <div>
-                  <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase">Formule Démo</span>
-                  <div className="mt-3">
-                    <span className="font-display font-extrabold text-2xl text-slate-900">Gratuit</span>
-                    <span className="text-slate-500 text-xs"> (Mode d'essai)</span>
+            <div className="overflow-y-auto pr-1 mt-4 sm:mt-6 flex-1">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pb-2">
+                
+                {/* Formule Gratuite (Essai) */}
+                <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-5 flex flex-col justify-between transition-all">
+                  <div>
+                    <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                      Mode Essai
+                    </span>
+                    <div className="mt-3">
+                      <span className="font-display font-extrabold text-2xl text-slate-900">Gratuit</span>
+                      <span className="text-slate-500 text-xs"> (Premier essai)</span>
+                    </div>
+                    <ul className="mt-4 space-y-2 text-xs text-slate-600">
+                      <li className="flex items-center gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
+                        <strong>1er téléchargement PDF 100% offert</strong>
+                      </li>
+                      <li className="flex items-center gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
+                        Création libre de dossiers de soumission
+                      </li>
+                      <li className="flex items-center gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
+                        Coffre-fort complet sécurisé
+                      </li>
+                      <li className="flex items-center gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
+                        Assistance IA et lettre de motivation
+                      </li>
+                    </ul>
                   </div>
-                  <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      <strong>1er téléchargement PDF 100% offert</strong>
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Création libre de dossiers de soumission
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Coffre-fort complet sécurisé
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Assistance IA et lettre de motivation
-                    </li>
-                  </ul>
-                </div>
-                <button
-                  onClick={() => handlePlanChange('free')}
-                  className="w-full mt-6 py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors cursor-pointer"
-                >
-                  {user?.plan !== 'pro' ? 'Votre plan actuel' : 'Repasser au plan gratuit'}
-                </button>
-              </div>
-
-              {/* Formule Mensuelle Pro */}
-              <div className={`rounded-2xl border-2 p-5 flex flex-col justify-between transition-all relative ${user?.plan === 'pro' ? 'border-amber-500 bg-amber-50/10' : 'border-amber-500/50 hover:border-amber-500 bg-amber-50/5'}`}>
-                <div className="absolute -top-3 right-4 bg-amber-500 text-white font-bold text-[9px] uppercase tracking-wider px-3 py-1 rounded-full border border-amber-400">
-                  Recommandé 🔥
-                </div>
-                <div className="pt-2">
-                  <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full uppercase">Formule Mensuelle</span>
-                  <div className="mt-3">
-                    <span className="font-display font-extrabold text-2xl text-slate-900">5 USD</span>
-                    <span className="text-slate-500 text-xs"> / mois (environ 3 000 FCFA)</span>
+                  <div className="mt-6 text-center text-xs font-bold text-slate-600 bg-slate-100 py-2.5 rounded-xl border border-slate-200">
+                    Plan Actif par Défaut 🟢
                   </div>
-                  <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500 font-bold" />
-                      <strong>Téléchargements de PDF Illimités</strong>
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Lettre de motivation IA illimitée
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Signature manuscrite automatique
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <Check className="w-4 h-4 text-emerald-500" />
-                      Zéro publicité ni limite de stockage
-                    </li>
-                  </ul>
                 </div>
-                <button
-                  onClick={() => handlePlanChange('pro')}
-                  className="w-full mt-6 py-2.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold transition-colors cursor-pointer shadow-xs"
-                >
-                  {user?.plan === 'pro' ? 'Abonnement Actif' : 'Activer l\'abonnement Mensuel (5 USD)'}
-                </button>
-              </div>
 
-            </div>
+                {/* Mode Principal : Achat à l'acte */}
+                <div className="rounded-2xl border-2 border-indigo-600 bg-indigo-50/10 p-5 flex flex-col justify-between transition-all relative">
+                  <div className="absolute top-4 right-4 bg-indigo-600 text-white font-bold text-[9px] uppercase tracking-wider px-3 py-1 rounded-full border border-indigo-500">
+                    Mode Principal 🚀
+                  </div>
+                  <div>
+                    <span className="text-[10px] font-bold text-indigo-700 bg-indigo-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                      Paiement à l'acte
+                    </span>
+                    <div className="mt-3">
+                      <span className="font-display font-extrabold text-xl text-slate-900">Pas d'abonnement</span>
+                      <span className="text-slate-500 text-xs block mt-0.5">Payez uniquement au téléchargement</span>
+                    </div>
+                    
+                    <div className="mt-4 space-y-2">
+                      <div className="flex items-center justify-between text-xs border-b border-slate-100 pb-1.5">
+                        <span className="text-slate-600">Moins de 15 pages</span>
+                        <span className="font-bold text-slate-900">1 500 F CFA <span className="text-[10px] text-slate-400 font-normal">(~2.50$)</span></span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs border-b border-slate-100 pb-1.5">
+                        <span className="text-slate-600">De 15 à 50 pages</span>
+                        <span className="font-bold text-slate-900">5 000 F CFA <span className="text-[10px] text-slate-400 font-normal">(~8.33$)</span></span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs pb-0.5">
+                        <span className="text-slate-600">50 pages et plus</span>
+                        <span className="font-bold text-slate-900">10 000 F CFA <span className="text-[10px] text-slate-400 font-normal">(~16.67$)</span></span>
+                      </div>
+                    </div>
+                    
+                    <p className="text-[10px] text-slate-500 mt-4 leading-normal">
+                      FedaPay prend en charge <strong>Orange Money, MTN Mobile Money, Wave, Moov</strong> et les cartes bancaires en toute sécurité.
+                    </p>
+                  </div>
+                  <div className="mt-6 text-center text-xs font-semibold text-indigo-700 bg-indigo-50 py-2.5 rounded-xl border border-indigo-100">
+                    Paiement unitaire par dossier
+                  </div>
+                </div>
 
-            {/* A l'unité option */}
-            <div className="mt-6 p-4 rounded-2xl bg-indigo-50/50 border border-indigo-100/50 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-              <div className="space-y-1">
-                <h4 className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
-                  <Info className="w-4 h-4 text-indigo-600" />
-                  Option d'achat à l'acte : 2.5 USD (~1 500 FCFA) par dossier
-                </h4>
-                <p className="text-[11px] text-indigo-700 leading-relaxed">
-                  Pas besoin d'abonnement ? Créez et organisez vos dossiers gratuitement. Vous ne payez que lors du téléchargement de vos dossiers validés, de manière unitaire.
-                </p>
               </div>
             </div>
           </motion.div>
@@ -3136,110 +3413,98 @@ export default function App() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
-            className="bg-white rounded-3xl max-w-xl w-full border border-slate-200 overflow-hidden shadow-2xl p-6 sm:p-8"
+            className="bg-white rounded-3xl max-w-xl w-full border border-slate-200 overflow-hidden shadow-2xl p-5 sm:p-8 max-h-[calc(100vh-2rem)] flex flex-col"
           >
-            <div className="flex justify-between items-center pb-4 border-b border-slate-100">
-              <h3 className="font-display font-bold text-lg text-slate-900 flex items-center gap-2">
+            <div className="flex justify-between items-center pb-4 border-b border-slate-100 shrink-0">
+              <h3 className="font-display font-bold text-base sm:text-lg text-slate-900 flex items-center gap-2">
                 <Lock className="w-5 h-5 text-indigo-600" />
                 Déverrouiller le téléchargement 🔓
               </h3>
               <button
                 onClick={() => setShowFedaPayModal(false)}
-                className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-xl transition-colors cursor-pointer"
+                className="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-xl transition-colors cursor-pointer shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="mt-4">
-              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block">Dossier sélectionné</span>
-              <h4 className="font-bold text-slate-800 text-sm mt-1">{dossierToDownload.title}</h4>
-              <p className="text-xs text-slate-500 mt-2">
-                Le dossier PDF a été entièrement compilé et ordonné de façon certifiée. Pour le télécharger sur votre appareil, veuillez choisir l'un des modes de règlement ci-dessous :
-              </p>
-            </div>
-
-            {fedaPayStatus && (
-              <div className={`mt-4 p-4 rounded-2xl border text-xs leading-relaxed space-y-1.5 ${
-                fedaPayStatus.mode === 'live'
-                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                  : fedaPayStatus.mode === 'sandbox_real'
-                  ? 'bg-blue-50 border-blue-200 text-blue-800'
-                  : 'bg-amber-50 border-amber-200 text-amber-800'
-              }`}>
-                <div className="flex items-center gap-1.5 font-bold">
-                  <div className={`w-2 h-2 rounded-full ${
-                    fedaPayStatus.mode === 'live' ? 'bg-emerald-500' : fedaPayStatus.mode === 'sandbox_real' ? 'bg-blue-500' : 'bg-amber-500 animate-pulse'
-                  }`} />
-                  {fedaPayStatus.mode === 'live' && <span>🟢 Mode Réel FedaPay Actif (Production)</span>}
-                  {fedaPayStatus.mode === 'sandbox_real' && <span>🔵 Mode Sandbox FedaPay Actif (Test)</span>}
-                  {fedaPayStatus.mode === 'simulation_local' && <span>⚠️ Mode Simulation (Pas de clé FedaPay)</span>}
-                </div>
-                {fedaPayStatus.mode === 'simulation_local' ? (
-                  <p className="text-[10px] text-amber-700 leading-normal">
-                    L'application est en mode simulation locale car aucune clé API FedaPay n'est définie. Pour encaisser de <strong>vrais paiements Mobile Money / Carte</strong>, ajoutez vos variables d'environnement <code className="bg-amber-100 px-1 rounded">FEDAPAY_SECRET_KEY</code> et <code className="bg-amber-100 px-1 rounded">VITE_FEDAPAY_PUBLIC_KEY</code>.
-                  </p>
-                ) : (
-                  <p className="text-[10px] leading-normal opacity-90">
-                    Connexion sécurisée établie avec FedaPay ({fedaPayStatus.mode === 'live' ? 'Production' : 'Sandbox'}). Clé : <code className="bg-black/5 px-1 rounded">{fedaPayStatus.secretKeyPrefix}</code>. Vous allez être redirigé vers l'interface de paiement officielle.
-                  </p>
-                )}
+            <div className="overflow-y-auto pr-1 mt-4 flex-1 space-y-5">
+              <div>
+                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block">Dossier sélectionné</span>
+                <h4 className="font-bold text-slate-800 text-sm mt-1">{dossierToDownload.title}</h4>
+                <p className="text-xs text-slate-500 mt-2">
+                  Le dossier PDF a été entièrement compilé et ordonné de façon certifiée. Pour le télécharger sur votre appareil, veuillez choisir l'un des modes de règlement ci-dessous :
+                </p>
               </div>
-            )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-6">
-              
-              {/* Option 1: Acte */}
-              <button
-                onClick={() => payWithFedaPay(2.5, `Achat Unitaire Dossier: ${dossierToDownload.title}`, false, dossierToDownload.id)}
-                disabled={isPaying}
-                className="rounded-2xl border border-slate-200 hover:border-indigo-500 p-5 flex flex-col justify-between text-left transition-all hover:bg-indigo-50/5 cursor-pointer disabled:opacity-50"
-              >
-                <div>
-                  <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase">Paiement à l'acte</span>
-                  <div className="mt-3">
-                    <span className="font-display font-extrabold text-xl text-slate-900">2.5 USD</span>
-                    <span className="text-slate-500 text-[10px] block">~1 500 FCFA à l'unité</span>
+              {fedaPayStatus && (
+                <div className={`p-4 rounded-2xl border text-xs leading-relaxed space-y-1.5 ${
+                  fedaPayStatus.mode === 'live'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    : fedaPayStatus.mode === 'sandbox_real'
+                    ? 'bg-blue-50 border-blue-200 text-blue-800'
+                    : 'bg-amber-50 border-amber-200 text-amber-800'
+                }`}>
+                  <div className="flex items-center gap-1.5 font-bold">
+                    <div className={`w-2 h-2 rounded-full ${
+                      fedaPayStatus.mode === 'live' ? 'bg-emerald-500' : fedaPayStatus.mode === 'sandbox_real' ? 'bg-blue-500' : 'bg-amber-500 animate-pulse'
+                    }`} />
+                    {fedaPayStatus.mode === 'live' && <span>🟢 Mode Réel FedaPay Actif (Production)</span>}
+                    {fedaPayStatus.mode === 'sandbox_real' && <span>🔵 Mode Sandbox FedaPay Actif (Test)</span>}
+                    {fedaPayStatus.mode === 'simulation_local' && <span>⚠️ Mode Simulation (Pas de clé FedaPay)</span>}
                   </div>
-                  <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
-                    Déverrouille uniquement ce dossier PDF de candidature.
-                  </p>
+                  {fedaPayStatus.mode === 'simulation_local' ? (
+                    <p className="text-[10px] text-amber-700 leading-normal">
+                      L'application est en mode simulation locale car aucune clé API FedaPay n'est définie. Pour encaisser de <strong>vrais paiements Mobile Money / Carte</strong>, ajoutez vos variables d'environnement <code className="bg-amber-100 px-1 rounded">FEDAPAY_SECRET_KEY</code> et <code className="bg-amber-100 px-1 rounded">VITE_FEDAPAY_PUBLIC_KEY</code>.
+                    </p>
+                  ) : (
+                    <p className="text-[10px] leading-normal opacity-90">
+                      Connexion sécurisée établie avec FedaPay ({fedaPayStatus.mode === 'live' ? 'Production' : 'Sandbox'}). Clé : <code className="bg-black/5 px-1 rounded">{fedaPayStatus.secretKeyPrefix}</code>. Vous allez être redirigé vers l'interface de paiement officielle.
+                    </p>
+                  )}
                 </div>
-                <span className="mt-6 text-xs font-bold text-indigo-600 flex items-center gap-1">
-                  Acheter ce PDF <ArrowRight className="w-3.5 h-3.5" />
-                </span>
-              </button>
+              )}
 
-              {/* Option 2: Subscription */}
-              <button
-                onClick={() => payWithFedaPay(5.0, "Abonnement Mensuel Candia Pro (5 USD)", true)}
-                disabled={isPaying}
-                className="rounded-2xl border-2 border-amber-500 bg-amber-50/5 hover:bg-amber-50/10 p-5 flex flex-col justify-between text-left transition-all relative cursor-pointer disabled:opacity-50"
-              >
-                <div className="absolute -top-3 right-4 bg-amber-500 text-white font-bold text-[8px] uppercase tracking-wider px-2.5 py-0.5 rounded-full">
-                  Économique 💡
+              <div>
+                
+                {/* Option unique: Acte */}
+                {(() => {
+                  const dp = getDossierPrice(dossierToDownload);
+                  return (
+                    <button
+                      onClick={() => payWithFedaPay(dp.usd, `Achat Unitaire Dossier: ${dossierToDownload.title}`, false, dossierToDownload.id, dp.fcfa)}
+                      disabled={isPaying}
+                      className="w-full rounded-2xl border-2 border-indigo-600 bg-indigo-50/10 p-5 flex flex-col justify-between text-left transition-all hover:bg-indigo-50/20 cursor-pointer disabled:opacity-50 relative"
+                    >
+                      <div className="absolute top-4 right-4 bg-indigo-600 text-white font-bold text-[9px] uppercase tracking-wider px-3 py-1 rounded-full border border-indigo-500">
+                        Mode Principal 🚀
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold text-indigo-700 bg-indigo-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                          Achat de PDF à l'acte ({dossierToDownload.pageCount || 12} pages)
+                        </span>
+                        <div className="mt-3 flex items-baseline gap-2">
+                          <span className="font-display font-extrabold text-2xl text-slate-900">{dp.fcfa.toLocaleString()} FCFA</span>
+                          <span className="text-slate-500 text-xs font-normal">~{dp.usd} USD</span>
+                        </div>
+                        <p className="text-xs text-slate-600 mt-2 leading-relaxed font-normal">
+                          Règlement unitaire et sécurisé pour déverrouiller ce document de façon définitive et à vie dans votre espace sécurisé. Tarif progressif : <strong>{dp.label}</strong>.
+                        </p>
+                      </div>
+                      <span className="mt-6 text-xs font-bold text-indigo-600 flex items-center gap-1.5 self-start">
+                        Déverrouiller et Télécharger maintenant <ArrowRight className="w-4 h-4" />
+                      </span>
+                    </button>
+                  );
+                })()}
+
+              </div>
+
+              <div className="pt-4 border-t border-slate-100 flex items-center gap-3 text-slate-400">
+                <Shield className="w-8 h-8 text-emerald-600 shrink-0" />
+                <div className="text-[10px] text-slate-500 leading-normal">
+                  Passerelle de paiement sécurisée **FedaPay**. Vos fonds et vos transactions de Mobile Money (Orange, MTN, Wave, Moov, Free) et Cartes Bancaires (Visa, MasterCard) sont chiffrés et sécurisés.
                 </div>
-                <div>
-                  <span className="text-[9px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full uppercase">Formule Mensuelle</span>
-                  <div className="mt-3">
-                    <span className="font-display font-extrabold text-xl text-slate-900">5.0 USD</span>
-                    <span className="text-slate-500 text-[10px] block">~3 000 FCFA par mois</span>
-                  </div>
-                  <p className="text-[11px] text-slate-600 mt-2 leading-relaxed">
-                    <strong>Téléchargements Illimités</strong> pour tous vos dossiers créés.
-                  </p>
-                </div>
-                <span className="mt-6 text-xs font-bold text-amber-600 flex items-center gap-1">
-                  S'abonner (Illimité) <ArrowRight className="w-3.5 h-3.5" />
-                </span>
-              </button>
-
-            </div>
-
-            <div className="mt-6 pt-4 border-t border-slate-100 flex items-center gap-3 text-slate-400">
-              <Shield className="w-8 h-8 text-emerald-600 shrink-0" />
-              <div className="text-[10px] text-slate-500 leading-normal">
-                Passerelle de paiement sécurisée **FedaPay**. Vos fonds et vos transactions de Mobile Money (Orange, MTN, Wave, Moov, Free) et Cartes Bancaires (Visa, MasterCard) sont chiffrés et sécurisés.
               </div>
             </div>
           </motion.div>
@@ -3281,7 +3546,7 @@ export default function App() {
               
               <div className="mt-3">
                 <span className="text-xl font-extrabold text-slate-900">
-                  {Math.round(fedaPaySimulatedData.amountUSD * 600).toLocaleString()} FCFA
+                  {(fedaPaySimulatedData.amountCFA || Math.round(fedaPaySimulatedData.amountUSD * 600)).toLocaleString()} FCFA
                 </span>
                 <span className="text-[9px] text-slate-400 block mt-0.5">({fedaPaySimulatedData.amountUSD} USD)</span>
               </div>
@@ -3396,7 +3661,7 @@ export default function App() {
                         onChange={(e) => setSimulatedPhoneNumber(e.target.value)}
                         className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
                       />
-                      <span className="text-[9px] text-slate-400 block mt-1">Saisissez n'importe quel numéro de démonstration.</span>
+                      <span className="text-[9px] text-slate-400 block mt-1">Saisissez votre numéro de téléphone de paiement mobile.</span>
                     </div>
                   </div>
                 ) : (

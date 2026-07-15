@@ -141,6 +141,7 @@ export interface GeneratedDossier {
   createdAt: string;
   pdfPath: string; // Path to generated PDF file
   size: number;
+  pageCount?: number;
   piecesIncluded: {
     nomOriginal: string;
     categorie: DocumentCategory;
