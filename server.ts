@@ -273,9 +273,9 @@ function getDB(): LocalDB {
 
       // Sync role attribute for all users
       parsed.users.forEach((u: any) => {
-        if (!u.role) {
-          u.role = (u.email.toLowerCase() === 'admin@candia.ai') ? 'admin' : 'user';
-        }
+        const emailLower = u.email ? u.email.toLowerCase() : '';
+        const isUserAdmin = emailLower === 'admin@candia.ai' || emailLower === 'yoloucerveaux@gmail.com';
+        u.role = isUserAdmin ? 'admin' : 'user';
         if (!u.unlockedDossiers) {
           u.unlockedDossiers = [];
         }
@@ -285,9 +285,9 @@ function getDB(): LocalDB {
       });
 
       if (parsed.user) {
-        if (!parsed.user.role) {
-          parsed.user.role = (parsed.user.email.toLowerCase() === 'admin@candia.ai') ? 'admin' : 'user';
-        }
+        const emailLower = parsed.user.email ? parsed.user.email.toLowerCase() : '';
+        const isUserAdmin = emailLower === 'admin@candia.ai' || emailLower === 'yoloucerveaux@gmail.com';
+        parsed.user.role = isUserAdmin ? 'admin' : 'user';
         if (!parsed.user.unlockedDossiers) {
           parsed.user.unlockedDossiers = [];
         }
@@ -362,14 +362,16 @@ app.post('/api/auth/firebase-sync', async (req, res) => {
     }
 
     const db = getDB();
-    let foundUser = db.users.find(u => u.id === uid || u.email.toLowerCase() === email.toLowerCase());
+    const emailLower = email.toLowerCase();
+    const targetRole = (emailLower === 'admin@candia.ai' || emailLower === 'yoloucerveaux@gmail.com') ? 'admin' : 'user';
+    let foundUser = db.users.find(u => u.id === uid || u.email.toLowerCase() === emailLower);
 
     if (!foundUser) {
       // Create a brand new Firebase user profile in DB
       foundUser = {
         id: uid,
         name: name || email.split('@')[0],
-        email: email.toLowerCase(),
+        email: emailLower,
         plan: 'free',
         monthlyDossiersCreated: 0,
         country: country || 'Sénégal',
@@ -377,7 +379,7 @@ app.post('/api/auth/firebase-sync', async (req, res) => {
         createdAt: new Date().toISOString(),
         emailVerified: true,
         lastActiveAt: new Date().toISOString(),
-        role: 'user',
+        role: targetRole,
         unlockedDossiers: [],
         downloadedDossiers: []
       };
@@ -394,6 +396,7 @@ app.post('/api/auth/firebase-sync', async (req, res) => {
       }
       foundUser.lastActiveAt = new Date().toISOString();
       foundUser.emailVerified = true;
+      foundUser.role = targetRole; // Ensure correct role is synchronized
       if (name) foundUser.name = name;
       if (country) foundUser.country = country;
     }
@@ -796,52 +799,143 @@ app.delete('/api/safe/:id', (req, res) => {
 });
 
 // Custom PDF generation helper for plain text (cover letters)
-async function generatePdfFromText(content: string): Promise<Buffer> {
+async function generatePdfFromText(content: string, themeName: string = 'classic'): Promise<Buffer> {
   const pdfDoc = await PDFDocument.create();
   const page = pdfDoc.addPage([595.276, 841.89]); // A4 Size
   const { width, height } = page.getSize();
   
-  const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  let regularFontName = StandardFonts.Helvetica;
+  let boldFontName = StandardFonts.HelveticaBold;
+  let primaryColor = rgb(0.12, 0.43, 0.84); // Classic Navy Blue
+  let secondaryColor = rgb(0.4, 0.4, 0.4);
+  
+  if (themeName === 'modern') {
+    regularFontName = StandardFonts.Helvetica;
+    boldFontName = StandardFonts.HelveticaBold;
+    primaryColor = rgb(0.08, 0.12, 0.2); // Slate / Charcoal
+    secondaryColor = rgb(0.3, 0.4, 0.5);
+  } else if (themeName === 'editorial') {
+    regularFontName = StandardFonts.TimesRoman;
+    boldFontName = StandardFonts.TimesRomanBold;
+    primaryColor = rgb(0.48, 0.24, 0.08); // Warm Terracotta / Editorial Brown
+    secondaryColor = rgb(0.4, 0.4, 0.4);
+  } else if (themeName === 'creative') {
+    regularFontName = StandardFonts.Courier;
+    boldFontName = StandardFonts.CourierBold;
+    primaryColor = rgb(0.55, 0.1, 0.65); // Creative Deep Purple
+    secondaryColor = rgb(0.4, 0.4, 0.4);
+  }
+  
+  const fontRegular = await pdfDoc.embedFont(regularFontName);
+  const fontBold = await pdfDoc.embedFont(boldFontName);
   
   const marginX = 55;
   const marginY = 60;
   const printableWidth = width - marginX * 2;
   const fontSize = 10;
   const lineHeight = 15;
-  const maxCharLength = 85;
+  const maxCharLength = themeName === 'creative' ? 70 : 85; // Courier needs shorter lines due to monospace width
+  
+  // Decorative layouts based on selected theme
+  if (themeName === 'classic') {
+    // Top border line
+    page.drawRectangle({
+      x: 0,
+      y: height - 12,
+      width,
+      height: 12,
+      color: primaryColor,
+    });
+  } else if (themeName === 'modern') {
+    // Left side vertical line accent
+    page.drawLine({
+      start: { x: 30, y: height - 40 },
+      end: { x: 30, y: 40 },
+      thickness: 2,
+      color: primaryColor,
+    });
+  } else if (themeName === 'editorial') {
+    // Double border box framing
+    page.drawRectangle({
+      x: 30,
+      y: 30,
+      width: width - 60,
+      height: height - 60,
+      borderColor: primaryColor,
+      borderWidth: 1.5,
+    });
+    page.drawRectangle({
+      x: 34,
+      y: 34,
+      width: width - 68,
+      height: height - 68,
+      borderColor: primaryColor,
+      borderWidth: 0.5,
+    });
+  } else if (themeName === 'creative') {
+    // Modern block designs
+    page.drawRectangle({
+      x: 0,
+      y: height - 20,
+      width: 25,
+      height: 20,
+      color: primaryColor,
+    });
+    page.drawRectangle({
+      x: 35,
+      y: height - 20,
+      width: width - 70,
+      height: 4,
+      color: secondaryColor,
+    });
+  }
   
   // Split raw text into wrapped lines
   const paragraphs = content.split('\n');
-  const allLines: { text: string; isSpacing: boolean }[] = [];
+  const allLines: { text: string; isSpacing: boolean; isHeader?: boolean; isSubject?: boolean }[] = [];
   
   for (const para of paragraphs) {
     const trimmed = para.trim();
     if (trimmed === '') {
       allLines.push({ text: '', isSpacing: true });
     } else {
+      // Basic detection of headings/subjects
+      const isSubject = trimmed.toLowerCase().startsWith('objet') || trimmed.toLowerCase().startsWith('obj :');
+      const isHeader = trimmed.includes('[') || trimmed.includes(']') || (trimmed.length < 45 && trimmed.endsWith(':'));
+      
       const words = trimmed.split(' ');
       let currentLine = '';
       for (const word of words) {
         if ((currentLine + ' ' + word).trim().length <= maxCharLength) {
           currentLine = currentLine ? currentLine + ' ' + word : word;
         } else {
-          allLines.push({ text: currentLine, isSpacing: false });
+          allLines.push({ text: currentLine, isSpacing: false, isHeader, isSubject });
           currentLine = word;
         }
       }
       if (currentLine) {
-        allLines.push({ text: currentLine, isSpacing: false });
+        allLines.push({ text: currentLine, isSpacing: false, isHeader, isSubject });
       }
     }
   }
 
   let currentPage = page;
-  let yPosition = height - marginY;
+  let yPosition = height - marginY - 15;
   
   for (const lineObj of allLines) {
     if (yPosition < marginY + 20) {
       currentPage = pdfDoc.addPage([595.276, 841.89]);
+      
+      // Secondary page layout borders
+      if (themeName === 'classic') {
+        currentPage.drawRectangle({ x: 0, y: height - 12, width, height: 12, color: primaryColor });
+      } else if (themeName === 'modern') {
+        currentPage.drawLine({ start: { x: 30, y: height - 40 }, end: { x: 30, y: 40 }, thickness: 2, color: primaryColor });
+      } else if (themeName === 'editorial') {
+        currentPage.drawRectangle({ x: 30, y: 30, width: width - 60, height: height - 60, borderColor: primaryColor, borderWidth: 1.5 });
+        currentPage.drawRectangle({ x: 34, y: 34, width: width - 68, height: height - 68, borderColor: primaryColor, borderWidth: 0.5 });
+      }
+      
       yPosition = height - marginY;
     }
     
@@ -855,12 +949,24 @@ async function generatePdfFromText(content: string): Promise<Buffer> {
         .replace(/\u2014/g, '--')
         .replace(/\u2026/g, '...');
         
+      let fontToUse = fontRegular;
+      let colorToUse = rgb(0.12, 0.12, 0.12);
+      let sizeToUse = fontSize;
+      
+      if (lineObj.isSubject) {
+        fontToUse = fontBold;
+        colorToUse = primaryColor;
+        sizeToUse = fontSize + 1;
+      } else if (lineObj.isHeader) {
+        colorToUse = secondaryColor;
+      }
+      
       currentPage.drawText(cleanText, {
         x: marginX,
         y: yPosition,
-        size: fontSize,
-        font: fontRegular,
-        color: rgb(0.12, 0.12, 0.12),
+        size: sizeToUse,
+        font: fontToUse,
+        color: colorToUse,
       });
       yPosition -= lineHeight;
     }
@@ -1010,7 +1116,7 @@ Génère la lettre de motivation sous forme de texte brut. Ne mets aucun tag mar
 // Save text as custom PDF to the safe
 app.post('/api/safe/save-text', async (req, res) => {
   try {
-    const { content, filename, category } = req.body;
+    const { content, filename, category, theme } = req.body;
     if (!content || !filename || !category) {
       return res.status(400).json({ error: 'Contenu, nom de fichier, et catégorie sont obligatoires.' });
     }
@@ -1032,8 +1138,8 @@ app.post('/api/safe/save-text', async (req, res) => {
     const uniqueFilename = `${Date.now()}_${cleanName}`;
     const filePath = path.join(SAFE_DIR, uniqueFilename);
 
-    // Generate PDF representation of our plain text cover letter
-    const pdfBuffer = await generatePdfFromText(content);
+    // Generate PDF representation of our plain text cover letter with selected theme layout
+    const pdfBuffer = await generatePdfFromText(content, theme);
     
     // Write physical file
     fs.writeFileSync(filePath, pdfBuffer);
@@ -1399,90 +1505,162 @@ app.post('/api/dossiers/generate', async (req, res) => {
       const coverPage = mergedPdf.addPage([595.276, 841.89]); // A4 in points
       const { width, height } = coverPage.getSize();
 
-      const helveticaBold = await mergedPdf.embedFont(StandardFonts.HelveticaBold);
-      const helvetica = await mergedPdf.embedFont(StandardFonts.Helvetica);
+      const coverTheme = coverPageOptions.theme || 'classic';
 
-      // Top decorative bar
-      coverPage.drawRectangle({
-        x: 0,
-        y: height - 15,
-        width,
-        height: 15,
-        color: rgb(0.12, 0.43, 0.84), // Professional Tech Blue
-      });
+      let regularFontName = StandardFonts.Helvetica;
+      let boldFontName = StandardFonts.HelveticaBold;
+      let primaryColor = rgb(0.12, 0.43, 0.84); // Classic Navy Blue
+      let secondaryColor = rgb(0.4, 0.4, 0.4);
+      let titleColor = rgb(0.08, 0.12, 0.2);
+
+      if (coverTheme === 'modern') {
+        regularFontName = StandardFonts.Helvetica;
+        boldFontName = StandardFonts.HelveticaBold;
+        primaryColor = rgb(0.08, 0.12, 0.2); // Slate / Charcoal
+        secondaryColor = rgb(0.3, 0.4, 0.5);
+        titleColor = rgb(0.1, 0.15, 0.25);
+      } else if (coverTheme === 'editorial') {
+        regularFontName = StandardFonts.TimesRoman;
+        boldFontName = StandardFonts.TimesRomanBold;
+        primaryColor = rgb(0.48, 0.24, 0.08); // Warm Terracotta / Editorial Brown
+        secondaryColor = rgb(0.4, 0.4, 0.4);
+        titleColor = rgb(0.2, 0.1, 0.05);
+      } else if (coverTheme === 'creative') {
+        regularFontName = StandardFonts.Courier;
+        boldFontName = StandardFonts.CourierBold;
+        primaryColor = rgb(0.55, 0.1, 0.65); // Creative Deep Purple
+        secondaryColor = rgb(0.4, 0.4, 0.4);
+        titleColor = rgb(0.3, 0.05, 0.35);
+      }
+
+      const helveticaBold = await mergedPdf.embedFont(boldFontName);
+      const helvetica = await mergedPdf.embedFont(regularFontName);
+
+      // Theme-specific background/decorations
+      if (coverTheme === 'classic') {
+        // Top decorative bar
+        coverPage.drawRectangle({
+          x: 0,
+          y: height - 15,
+          width,
+          height: 15,
+          color: primaryColor,
+        });
+      } else if (coverTheme === 'modern') {
+        // Left side vertical line accent
+        coverPage.drawLine({
+          start: { x: 30, y: height - 40 },
+          end: { x: 30, y: 40 },
+          thickness: 2,
+          color: primaryColor,
+        });
+      } else if (coverTheme === 'editorial') {
+        // Double border box framing
+        coverPage.drawRectangle({
+          x: 30,
+          y: 30,
+          width: width - 60,
+          height: height - 60,
+          borderColor: primaryColor,
+          borderWidth: 1.5,
+        });
+        coverPage.drawRectangle({
+          x: 34,
+          y: 34,
+          width: width - 68,
+          height: height - 68,
+          borderColor: primaryColor,
+          borderWidth: 0.5,
+        });
+      } else if (coverTheme === 'creative') {
+        // Top modern accent block
+        coverPage.drawRectangle({
+          x: 0,
+          y: height - 20,
+          width: 35,
+          height: 20,
+          color: primaryColor,
+        });
+        coverPage.drawRectangle({
+          x: 45,
+          y: height - 20,
+          width: width - 90,
+          height: 4,
+          color: secondaryColor,
+        });
+      }
 
       // Title Section
       coverPage.drawText('DOSSIER DE SOUMISSION', {
-        x: 50,
+        x: 55,
         y: height - 100,
-        size: 14,
+        size: 13,
         font: helveticaBold,
-        color: rgb(0.4, 0.4, 0.4),
+        color: secondaryColor,
       });
 
       coverPage.drawText(offer.title.substring(0, 50), {
-        x: 50,
+        x: 55,
         y: height - 150,
-        size: 26,
+        size: 24,
         font: helveticaBold,
-        color: rgb(0.08, 0.12, 0.2),
+        color: titleColor,
       });
 
       coverPage.drawText(`Destinataire : ${offer.organizer}`, {
-        x: 50,
+        x: 55,
         y: height - 185,
-        size: 14,
+        size: 13,
         font: helvetica,
-        color: rgb(0.3, 0.3, 0.3),
+        color: secondaryColor,
       });
 
       // Horizontal separator line
       coverPage.drawLine({
-        start: { x: 50, y: height - 210 },
-        end: { x: width - 50, y: height - 210 },
+        start: { x: 55, y: height - 210 },
+        end: { x: width - 55, y: height - 210 },
         thickness: 1,
         color: rgb(0.8, 0.8, 0.8),
       });
 
       // Candidate Metadata
       coverPage.drawText('INFORMATIONS DU CANDIDAT', {
-        x: 50,
+        x: 55,
         y: height - 250,
         size: 11,
         font: helveticaBold,
-        color: rgb(0.12, 0.43, 0.84),
+        color: primaryColor,
       });
 
       const candName = coverPageOptions.candidateName || db.user.name;
       const candEmail = coverPageOptions.candidateEmail || db.user.email;
 
-      coverPage.drawText(`Nom complet : ${candName}`, { x: 50, y: height - 275, size: 12, font: helvetica });
-      coverPage.drawText(`Adresse Email : ${candEmail}`, { x: 50, y: height - 295, size: 12, font: helvetica });
-      coverPage.drawText(`Date de génération : ${new Date().toLocaleDateString('fr-FR')}`, { x: 50, y: height - 315, size: 12, font: helvetica });
+      coverPage.drawText(`Nom complet : ${candName}`, { x: 55, y: height - 275, size: 11, font: helvetica });
+      coverPage.drawText(`Adresse Email : ${candEmail}`, { x: 55, y: height - 295, size: 11, font: helvetica });
+      coverPage.drawText(`Date de génération : ${new Date().toLocaleDateString('fr-FR')}`, { x: 55, y: height - 315, size: 11, font: helvetica });
       if (offer.deadline && offer.deadline !== 'Non spécifiée') {
-        coverPage.drawText(`Date Limite de l'offre : ${offer.deadline}`, { x: 50, y: height - 335, size: 12, font: helvetica, color: rgb(0.8, 0.2, 0.2) });
+        coverPage.drawText(`Date Limite de l'offre : ${offer.deadline}`, { x: 55, y: height - 335, size: 11, font: helvetica, color: rgb(0.8, 0.2, 0.2) });
       }
 
       // Notes / Summary Statement
       if (coverPageOptions.notes) {
-        coverPage.drawText('NOTE DE SYNTHÈSE', { x: 50, y: height - 380, size: 11, font: helveticaBold, color: rgb(0.12, 0.43, 0.84) });
-        // Draw paragraph safely (simple wrap)
+        coverPage.drawText('NOTE DE SYNTHÈSE', { x: 55, y: height - 380, size: 11, font: helveticaBold, color: primaryColor });
         const noteText = coverPageOptions.notes.substring(0, 180);
-        coverPage.drawText(noteText, { x: 50, y: height - 405, size: 10, font: helvetica, color: rgb(0.4, 0.4, 0.4) });
+        coverPage.drawText(noteText, { x: 55, y: height - 405, size: 10, font: helvetica, color: secondaryColor });
       }
 
       // Table of Contents Section
       coverPage.drawText('SOMMAIRE DES PIÈCES JOINTES', {
-        x: 50,
+        x: 55,
         y: height - 480,
-        size: 12,
+        size: 11,
         font: helveticaBold,
-        color: rgb(0.08, 0.12, 0.2),
+        color: titleColor,
       });
 
       coverPage.drawLine({
-        start: { x: 50, y: height - 490 },
-        end: { x: width - 50, y: height - 490 },
+        start: { x: 55, y: height - 490 },
+        end: { x: width - 55, y: height - 490 },
         thickness: 1,
         color: rgb(0.8, 0.8, 0.8),
       });
@@ -1492,7 +1670,7 @@ app.post('/api/dossiers/generate', async (req, res) => {
         coverPage.drawText(item.label.substring(0, 65), {
           x: 60,
           y: tocY,
-          size: 10,
+          size: 9,
           font: helvetica,
           color: rgb(0.2, 0.2, 0.2),
         });
@@ -1511,7 +1689,7 @@ app.post('/api/dossiers/generate', async (req, res) => {
           y: tocY,
           size: 10,
           font: helveticaBold,
-          color: rgb(0.12, 0.43, 0.84),
+          color: primaryColor,
         });
 
         tocY -= 22;
@@ -1519,7 +1697,7 @@ app.post('/api/dossiers/generate', async (req, res) => {
 
       // Brand Footer
       coverPage.drawText('Généré de manière certifiée par l\'application Candia SaaS.', {
-        x: 50,
+        x: 55,
         y: 40,
         size: 8,
         font: helvetica,

@@ -65,6 +65,7 @@ export async function syncFromFirestore(defaultDb: any): Promise<any> {
     };
 
     let hasDataInFirestore = false;
+    let anyCollectionFailed = false;
 
     for (const colName of collections) {
       try {
@@ -78,7 +79,13 @@ export async function syncFromFirestore(defaultDb: any): Promise<any> {
         });
       } catch (e) {
         console.error(`Error loading collection ${colName} from Firestore:`, e);
+        anyCollectionFailed = true;
       }
+    }
+
+    if (anyCollectionFailed) {
+      console.warn('⚠️ Some Firestore collections failed to load. Skipping sync to prevent overwriting or corrupting local DB.');
+      return null;
     }
 
     if (!hasDataInFirestore) {

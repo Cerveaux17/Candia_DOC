@@ -138,6 +138,8 @@ export default function App() {
   const [candidateName, setCandidateName] = useState('');
   const [candidateEmail, setCandidateEmail] = useState('');
   const [notes, setNotes] = useState('');
+  const [coverPageTheme, setCoverPageTheme] = useState('classic');
+  const [coverLetterTheme, setCoverLetterTheme] = useState('classic');
   const [generatingDossier, setGeneratingDossier] = useState(false);
   const [generationSuccess, setGenerationSuccess] = useState<GeneratedDossier | null>(null);
 
@@ -225,7 +227,8 @@ export default function App() {
         body: JSON.stringify({
           content: coverLetterText,
           filename: letterFilename,
-          category: letterSaveCategory
+          category: letterSaveCategory,
+          theme: coverLetterTheme
         })
       });
       const data = await res.json();
@@ -638,7 +641,7 @@ export default function App() {
           createdAt: data.user.createdAt || new Date().toISOString(),
           emailVerified: true,
           lastActiveAt: new Date().toISOString(),
-          role: data.user.role || (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com' ? 'admin' : 'user'),
+          role: (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com') ? 'admin' : (data.user.role || 'user'),
           unlockedDossiers: data.user.unlockedDossiers || [],
           downloadedDossiers: data.user.downloadedDossiers || []
         }, { merge: true });
@@ -769,7 +772,7 @@ export default function App() {
           createdAt: data.user.createdAt || new Date().toISOString(),
           emailVerified: true,
           lastActiveAt: new Date().toISOString(),
-          role: data.user.role || (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com' ? 'admin' : 'user'),
+          role: (fUser.email?.toLowerCase() === 'admin@candia.ai' || fUser.email?.toLowerCase() === 'yoloucerveaux@gmail.com') ? 'admin' : (data.user.role || 'user'),
           unlockedDossiers: data.user.unlockedDossiers || [],
           downloadedDossiers: data.user.downloadedDossiers || []
         }, { merge: true });
@@ -1071,6 +1074,7 @@ export default function App() {
         candidateName,
         candidateEmail,
         notes,
+        theme: coverPageTheme,
       },
       mappings: mappings.map((m) => ({
         pieceId: m.pieceId,
@@ -1664,12 +1668,6 @@ export default function App() {
           </div>
 
           <div className="flex items-center space-x-4">
-            {user?.plan === 'free' && (
-              <span className="hidden md:inline-flex items-center gap-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-100 px-3 py-1 rounded-full font-medium">
-                <Info className="w-3.5 h-3.5" />
-                Plan Gratuit (Limite: 3 PDF maximum)
-              </span>
-            )}
             <button
               onClick={() => setShowUpgradeModal(true)}
               className="text-xs font-semibold px-4 py-2 rounded-xl transition-all duration-200 flex items-center gap-1.5 shadow-xs bg-linear-to-r from-amber-500 to-orange-500 text-white hover:shadow-md cursor-pointer hover:scale-101"
@@ -2363,6 +2361,35 @@ export default function App() {
                             placeholder="Ex: Je présente ma candidature respectueuse au poste..."
                             className="w-full text-xs rounded-xl border border-slate-200 p-2.5 outline-none focus:border-indigo-500 placeholder:text-slate-400"
                           />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-xs font-semibold text-slate-600">Thème graphique de la page de garde</label>
+                          <div className="grid grid-cols-2 gap-2 mt-1">
+                            {[
+                              { id: 'classic', label: 'Bleu Classique', desc: 'Professionnel & Sobre' },
+                              { id: 'modern', label: 'Moderne Ardoise', desc: 'Épuré & Minimaliste' },
+                              { id: 'editorial', label: 'Académique Vert', desc: 'Littéraire & Élégant' },
+                              { id: 'creative', label: 'Technique Violet', desc: 'Moderne & Monospace' },
+                            ].map((themeOpt) => (
+                              <button
+                                key={themeOpt.id}
+                                type="button"
+                                onClick={() => setCoverPageTheme(themeOpt.id)}
+                                className={`p-2 rounded-xl border text-left transition-all cursor-pointer flex flex-col ${
+                                  coverPageTheme === themeOpt.id
+                                    ? 'border-indigo-600 bg-indigo-50/50 shadow-2xs'
+                                    : 'border-slate-200 hover:border-slate-300 bg-white'
+                                }`}
+                              >
+                                <span className={`text-[10px] font-bold ${coverPageTheme === themeOpt.id ? 'text-indigo-700' : 'text-slate-800'}`}>
+                                  {themeOpt.label}
+                                </span>
+                                <span className="text-[8px] text-slate-400 font-medium leading-none mt-0.5">
+                                  {themeOpt.desc}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
                         </div>
                       </div>
                     )}
@@ -3782,6 +3809,38 @@ export default function App() {
                   className="w-full h-80 text-xs rounded-xl border border-slate-200 p-4 outline-none focus:border-indigo-500 font-sans leading-relaxed resize-none bg-slate-50/50"
                   placeholder="Écrivez ou collez votre lettre de motivation ici..."
                 />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                  Thème graphique de la lettre de motivation
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    { id: 'classic', label: 'Classique', desc: 'Bleu Pro' },
+                    { id: 'modern', label: 'Moderne', desc: 'Ardoise' },
+                    { id: 'editorial', label: 'Académique', desc: 'Chaleureux' },
+                    { id: 'creative', label: 'Créatif', desc: 'Monospace' },
+                  ].map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setCoverLetterTheme(t.id)}
+                      className={`p-2 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center justify-center ${
+                        coverLetterTheme === t.id
+                          ? 'border-indigo-600 bg-indigo-50/50 shadow-2xs'
+                          : 'border-slate-200 hover:border-slate-300 bg-white'
+                      }`}
+                    >
+                      <span className={`text-[10px] font-bold ${coverLetterTheme === t.id ? 'text-indigo-700' : 'text-slate-800'}`}>
+                        {t.label}
+                      </span>
+                      <span className="text-[8px] text-slate-400 font-medium leading-none mt-0.5">
+                        {t.desc}
+                      </span>
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
