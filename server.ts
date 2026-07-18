@@ -2144,9 +2144,9 @@ app.get('/api/dossiers/check-download/:id', (req, res) => {
     return res.json({ allowed: true });
   }
 
-  // Check if free demo download is still available (exactly 1 free PDF demo download)
+  // Check if free demo download is still available (exactly 3 free PDF demo downloads)
   const downloadedCount = user?.downloadedDossiers?.length || 0;
-  if (downloadedCount === 0) {
+  if (downloadedCount < 3) {
     return res.json({ allowed: true, isFreeDemo: true });
   }
 
@@ -2805,8 +2805,8 @@ app.get('/api/dossiers/download/:id', (req, res) => {
     isAllowed = true;
   } else if (user?.unlockedDossiers?.includes(dossierId)) {
     isAllowed = true;
-  } else if ((user?.downloadedDossiers?.length || 0) === 0) {
-    // Consume the 1 free demo PDF download automatically
+  } else if ((user?.downloadedDossiers?.length || 0) < 3) {
+    // Consume one of the 3 free demo PDF downloads automatically
     isAllowed = true;
     if (user) {
       if (!user.downloadedDossiers) user.downloadedDossiers = [];
