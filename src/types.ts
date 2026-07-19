@@ -109,6 +109,7 @@ export interface SafeDocument {
   size: number;
   uploadedAt: string;
   path: string; // Internal file path
+  pageCount?: number;
 }
 
 export interface RecruitmentOffer {

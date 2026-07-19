@@ -143,6 +143,18 @@ export default function App() {
   const [generatingDossier, setGeneratingDossier] = useState(false);
   const [generationSuccess, setGenerationSuccess] = useState<GeneratedDossier | null>(null);
 
+  // Manual generator states
+  const [manualSelectedDocIds, setManualSelectedDocIds] = useState<string[]>([]);
+  const [manualTitle, setManualTitle] = useState('Mon Dossier de Candidature');
+  const [manualOrganizer, setManualOrganizer] = useState('Candidature Libre');
+  const [manualCoverPageEnabled, setManualCoverPageEnabled] = useState(true);
+  const [manualCandidateName, setManualCandidateName] = useState('');
+  const [manualCandidateEmail, setManualCandidateEmail] = useState('');
+  const [manualNotes, setManualNotes] = useState('');
+  const [manualCoverPageTheme, setManualCoverPageTheme] = useState('classic');
+  const [generatingManualDossier, setGeneratingManualDossier] = useState(false);
+  const [manualGenerationSuccess, setManualGenerationSuccess] = useState<GeneratedDossier | null>(null);
+
   // Auto-signature Configuration
   const [signatureEnabled, setSignatureEnabled] = useState(true);
   const [signatureCoords, setSignatureCoords] = useState({
@@ -157,6 +169,51 @@ export default function App() {
   // History states
   const [history, setHistory] = useState<GeneratedDossier[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
+
+  // Premium Trial & Pricing Helpers
+  const getPremiumTrialsRemaining = () => {
+    if (user?.plan && user?.plan !== 'free') return 999;
+    const premiumDownloadsCount = user?.downloadedDossiers?.filter(id => {
+      const d = history.find(x => x.id === id);
+      return d && d.offerId !== 'manual';
+    }).length || 0;
+    return Math.max(0, 3 - premiumDownloadsCount);
+  };
+
+  const isPremiumLimitReached = () => {
+    if (user?.plan && user?.plan !== 'free') return false;
+    return getPremiumTrialsRemaining() <= 0;
+  };
+
+  const getManualEstimatedPageCount = () => {
+    let pages = manualCoverPageEnabled ? 1 : 0;
+    manualSelectedDocIds.forEach(id => {
+      const doc = safeDocs.find(d => d.id === id);
+      pages += doc?.pageCount || 1;
+    });
+    return pages;
+  };
+
+  const getPremiumEstimatedPageCount = () => {
+    let pages = coverPageEnabled ? 1 : 0;
+    mappings.forEach(m => {
+      if (m.documentId) {
+        const doc = safeDocs.find(d => d.id === m.documentId);
+        pages += doc?.pageCount || 1;
+      }
+    });
+    return pages;
+  };
+
+  const getPriceForPages = (pages: number) => {
+    if (pages < 15) {
+      return { cfa: 1500, usd: 2.5, tier: 'Essentiel (< 15 p.)' };
+    } else if (pages <= 50) {
+      return { cfa: 5000, usd: 8.33, tier: 'Pro (15 - 50 p.)' };
+    } else {
+      return { cfa: 10000, usd: 16.67, tier: 'Business (> 50 p.)' };
+    }
+  };
 
   // Cover Letter AI Assistant states
   const [isCoverLetterModalOpen, setIsCoverLetterModalOpen] = useState(false);
@@ -176,6 +233,21 @@ export default function App() {
       setSelectedCvForLetter(firstCv.id);
     }
   }, [safeDocs]);
+
+  useEffect(() => {
+    if (user) {
+      if (!manualCandidateName) setManualCandidateName(user.name || '');
+      if (!manualCandidateEmail) setManualCandidateEmail(user.email || '');
+    }
+  }, [user]);
+
+  const [manualInitialized, setManualInitialized] = useState(false);
+  useEffect(() => {
+    if (safeDocs.length > 0 && !manualInitialized) {
+      setManualSelectedDocIds(safeDocs.map(d => d.id));
+      setManualInitialized(true);
+    }
+  }, [safeDocs, manualInitialized]);
 
   // Secure admin tab navigation: redirect non-admin users
   useEffect(() => {
@@ -343,9 +415,13 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const paymentStatus = params.get('payment_status');
     const message = params.get('message');
+    const generatedDossierId = params.get('generated_dossier_id');
     
     if (paymentStatus === 'success') {
       showSuccess(message || 'Votre paiement a été validé avec succès ! 🎉');
+      if (generatedDossierId) {
+        setActiveTab('history');
+      }
       // Clean query parameters from URL
       window.history.replaceState({}, document.title, window.location.pathname);
     } else if (paymentStatus === 'failed') {
@@ -399,8 +475,14 @@ export default function App() {
       const data = await res.json();
       if (data.allowed) {
         if (data.isFreeDemo) {
-          const countLeft = Math.max(1, 3 - (user?.downloadedDossiers?.length || 0));
-          alert(`Félicitations ! Vous téléchargez un dossier PDF d'essai gratuitement (Essai gratuit : il vous reste ${countLeft} téléchargement(s) offert(s) au total). Profitez-en ! 🎁`);
+          const premiumCount = user?.downloadedDossiers?.filter(id => {
+            const d = history.find(x => x.id === id);
+            return d && d.offerId !== 'manual';
+          }).length || 0;
+          const countLeft = Math.max(1, 3 - premiumCount);
+          alert(`Félicitations ! Vous téléchargez un dossier PDF Premium d'essai gratuitement (Essai gratuit : il vous reste ${countLeft} téléchargement(s) Premium offert(s) au total). Profitez-en ! 🎁`);
+        } else if (data.isFreeManual) {
+          alert(`Téléchargement de votre dossier d'assemblage manuel lancé avec succès ! (100% Gratuit et Illimité) 📄`);
         }
         // Start download
         window.open(getApiUrl(`/api/dossiers/download/${dossierId}`), '_blank');
@@ -1048,13 +1130,8 @@ export default function App() {
   const handleGenerateDossier = async () => {
     if (!currentOffer) return;
 
-    // Check plan restrictions
-    // Free has limit of 3. If reached, they must upgrade or check useUnitBilling of 2000 FCFA
-    const limitReached = (user?.plan === 'free' || !user?.plan) && (user?.monthlyDossiersCreated || 0) >= 3;
-    if (limitReached && !useUnitBilling) {
-      setShowUpgradeModal(true);
-      return;
-    }
+    // Check if premium limit reached
+    const limitReached = isPremiumLimitReached();
 
     const missingMandatory = mappings.filter((m) => m.obligatoire && !m.documentId);
     if (missingMandatory.length > 0) {
@@ -1093,6 +1170,61 @@ export default function App() {
       isPaidUnit: useUnitBilling,
     };
 
+    if (limitReached) {
+      try {
+        const draftRes = await fetch(getApiUrl('/api/dossiers/create-draft'), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!draftRes.ok) {
+          const errData = await draftRes.json();
+          throw new Error(errData.error || 'Échec de la création du brouillon.');
+        }
+
+        const draftResult = await draftRes.json();
+        const draftId = draftResult.draftDossier.id;
+        const pageCount = draftResult.draftDossier.estimatedPages;
+        const priceCFA = draftResult.draftDossier.costCFA;
+
+        if (!window.confirm(`Vous avez épuisé vos 3 essais premium gratuits. La génération de ce dossier (${pageCount} pages) nécessite un paiement unique de ${priceCFA} FCFA. Voulez-vous procéder au paiement sécurisé via FedaPay ?`)) {
+          setGeneratingDossier(false);
+          return;
+        }
+
+        // Create Checkout Session
+        const checkoutRes = await fetch(getApiUrl('/api/payments/create-checkout'), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            dossierId: draftId,
+            description: `Dossier Premium: ${currentOffer.title} (${pageCount} pages)`
+          }),
+        });
+
+        if (!checkoutRes.ok) {
+          const errData = await checkoutRes.json();
+          throw new Error(errData.error || 'Échec de la création du lien de paiement.');
+        }
+
+        const checkoutResult = await checkoutRes.json();
+        if (checkoutResult.url) {
+          window.location.href = checkoutResult.url;
+        } else {
+          throw new Error('URL de paiement introuvable.');
+        }
+      } catch (err: any) {
+        showError(err.message || 'Erreur lors de la préparation du paiement.');
+        setGeneratingDossier(false);
+      }
+      return;
+    }
+
     try {
       const res = await fetch(getApiUrl('/api/dossiers/generate'), {
         method: 'POST',
@@ -1116,6 +1248,94 @@ export default function App() {
       showError(err.message || 'Erreur de génération du PDF.');
     } finally {
       setGeneratingDossier(false);
+    }
+  };
+
+  const moveManualDocUp = (index: number) => {
+    if (index === 0) return;
+    const newIds = [...manualSelectedDocIds];
+    const temp = newIds[index];
+    newIds[index] = newIds[index - 1];
+    newIds[index - 1] = temp;
+    setManualSelectedDocIds(newIds);
+  };
+
+  const moveManualDocDown = (index: number) => {
+    if (index === manualSelectedDocIds.length - 1) return;
+    const newIds = [...manualSelectedDocIds];
+    const temp = newIds[index];
+    newIds[index] = newIds[index + 1];
+    newIds[index + 1] = temp;
+    setManualSelectedDocIds(newIds);
+  };
+
+  const toggleManualDocSelection = (docId: string) => {
+    if (manualSelectedDocIds.includes(docId)) {
+      setManualSelectedDocIds(manualSelectedDocIds.filter(id => id !== docId));
+    } else {
+      setManualSelectedDocIds([...manualSelectedDocIds, docId]);
+    }
+  };
+
+  const handleGenerateManualDossier = async () => {
+    if (manualSelectedDocIds.length === 0) {
+      showError("Veuillez sélectionner au moins un document à fusionner.");
+      return;
+    }
+
+    setGeneratingManualDossier(true);
+    setErrorMsg(null);
+    setManualGenerationSuccess(null);
+
+    const payload = {
+      offerId: 'manual',
+      manualTitle,
+      manualOrganizer,
+      coverPageOptions: {
+        enabled: manualCoverPageEnabled,
+        candidateName: manualCandidateName,
+        candidateEmail: manualCandidateEmail,
+        notes: manualNotes,
+        theme: manualCoverPageTheme,
+      },
+      mappings: manualSelectedDocIds.map((id, index) => {
+        const doc = safeDocs.find(d => d.id === id);
+        return {
+          pieceId: `manual_piece_${index}`,
+          documentId: id,
+          ordre: index + 1,
+          pieceName: doc ? doc.originalName : 'Document',
+        };
+      }),
+      signatureOptions: {
+        enabled: false,
+      },
+      isPaidUnit: useUnitBilling,
+    };
+
+    try {
+      const res = await fetch(getApiUrl('/api/dossiers/generate'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || 'Échec de la génération');
+      }
+
+      const result = await res.json();
+      setManualGenerationSuccess(result.dossier);
+      setUseUnitBilling(false);
+      showSuccess('Votre dossier de soumission PDF unique (manuel) a été généré avec succès !');
+      await Promise.all([fetchSession(), fetchHistory()]);
+    } catch (err: any) {
+      showError(err.message || 'Erreur de génération du PDF.');
+    } finally {
+      setGeneratingManualDossier(false);
     }
   };
 
@@ -1553,7 +1773,7 @@ export default function App() {
 
         {/* Sidebar Nav Tabs */}
         <nav className="flex-1 p-4 space-y-1.5 mt-4 overflow-y-auto">
-          <p className="text-[10px] uppercase font-bold text-slate-500 px-3 mb-2 tracking-widest">Fonctionnalités</p>
+          <p className="text-[10px] uppercase font-bold text-slate-500 px-3 mb-2 tracking-widest">Version Gratuite</p>
 
           <button
             onClick={() => { setActiveTab('safe'); setIsMobileSidebarOpen(false); }}
@@ -1569,11 +1789,27 @@ export default function App() {
           </button>
 
           <button
+            onClick={() => { setActiveTab('manual-generator'); setIsMobileSidebarOpen(false); }}
+            className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${activeTab === 'manual-generator' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
+          >
+            <FileText className="w-4 h-4 shrink-0 text-emerald-400" />
+            <span className="font-medium text-sm">2. Assemblage Manuel</span>
+            <span className="ml-auto bg-emerald-500/10 text-emerald-400 text-[8px] font-extrabold px-1.5 py-0.5 rounded uppercase tracking-wider">
+              Gratuit
+            </span>
+          </button>
+
+          <p className="text-[10px] uppercase font-bold text-slate-500 px-3 mb-2 mt-6 tracking-widest">Version Premium IA</p>
+
+          <button
             onClick={() => { setActiveTab('new-application'); setIsMobileSidebarOpen(false); }}
             className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${activeTab === 'new-application' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
           >
-            <UploadCloud className="w-4 h-4 shrink-0" />
-            <span className="font-medium text-sm">2. Analyser un Appel</span>
+            <UploadCloud className="w-4 h-4 shrink-0 text-amber-400" />
+            <span className="font-medium text-sm">3. Analyser un Appel</span>
+            <span className="ml-auto bg-amber-500/10 text-amber-400 text-[8px] font-extrabold px-1.5 py-0.5 rounded uppercase tracking-wider">
+              Premium
+            </span>
           </button>
 
           <button
@@ -1587,14 +1823,20 @@ export default function App() {
             }}
             className={`w-full flex items-center space-x-3 p-3 rounded-xl transition-all duration-150 cursor-pointer text-left ${!currentOffer ? 'opacity-40 cursor-not-allowed' : ''} ${activeTab === 'generator' ? 'bg-slate-900 text-indigo-300 font-semibold border-l-2 border-indigo-500' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
           >
-            <Layers className="w-4 h-4 shrink-0" />
-            <span className="font-medium text-sm flex-1">3. Ordonner & Signer</span>
-            {currentOffer && (
+            <Layers className="w-4 h-4 shrink-0 text-amber-400" />
+            <span className="font-medium text-sm flex-1">4. Ordonner & Signer</span>
+            {currentOffer ? (
               <span className="ml-auto bg-amber-500/20 text-amber-300 text-[10px] font-bold px-2 py-0.5 rounded-full animate-pulse">
                 Prêt
               </span>
+            ) : (
+              <span className="ml-auto bg-slate-900 text-slate-500 text-[8px] font-extrabold px-1.5 py-0.5 rounded uppercase tracking-wider">
+                Requis
+              </span>
             )}
           </button>
+
+          <p className="text-[10px] uppercase font-bold text-slate-500 px-3 mb-2 mt-6 tracking-widest">Général</p>
 
           <button
             onClick={() => { setActiveTab('history'); setIsMobileSidebarOpen(false); }}
@@ -1661,6 +1903,7 @@ export default function App() {
             <span className="hidden sm:inline text-slate-300">/</span>
             <span className="text-slate-950 font-semibold truncate max-w-[150px] sm:max-w-none">
               {activeTab === 'safe' && 'Mon Coffre-fort'}
+              {activeTab === 'manual-generator' && 'Assemblage Manuel (Gratuit)'}
               {activeTab === 'new-application' && 'Analyser un Appel'}
               {activeTab === 'generator' && (currentOffer ? currentOffer.title : 'Fusionner & Signer')}
               {activeTab === 'history' && 'Historique de Dossiers'}
@@ -2200,6 +2443,320 @@ export default function App() {
               </motion.div>
             )}
 
+            {/* 1.5. ASSEMBLAGE MANUEL TAB (VERSION GRATUITE) */}
+            {activeTab === 'manual-generator' && (
+              <motion.div
+                key="manual-generator-tab"
+                initial={{ opacity: 0, y: 15 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -15 }}
+                className="grid grid-cols-1 lg:grid-cols-3 gap-8"
+              >
+                {/* Left Column: Dossier Details & Cover Page */}
+                <div className="lg:col-span-1 space-y-6">
+                  {/* General Details */}
+                  <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-xs space-y-4">
+                    <div className="flex items-center gap-2 pb-2 border-b border-slate-100">
+                      <FileText className="w-5 h-5 text-emerald-500" />
+                      <h4 className="font-display font-bold text-slate-900 text-sm">Informations Générales</h4>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div className="space-y-1">
+                        <label className="text-xs font-semibold text-slate-600">Intitulé du Dossier</label>
+                        <input
+                          type="text"
+                          value={manualTitle}
+                          onChange={(e) => setManualTitle(e.target.value)}
+                          placeholder="Ex: Candidature Poste Développeur"
+                          className="w-full text-xs rounded-xl border border-slate-200 p-2.5 outline-none focus:border-indigo-500"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-xs font-semibold text-slate-600">Institution ou Organisme cible</label>
+                        <input
+                          type="text"
+                          value={manualOrganizer}
+                          onChange={(e) => setManualOrganizer(e.target.value)}
+                          placeholder="Ex: Ministère de la Santé / Senelec"
+                          className="w-full text-xs rounded-xl border border-slate-200 p-2.5 outline-none focus:border-indigo-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Cover Page Options */}
+                  <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-xs space-y-4">
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-100">
+                      <h4 className="font-display font-bold text-slate-900 text-sm">Page de Garde (Sommaire)</h4>
+                      <input
+                        type="checkbox"
+                        checked={manualCoverPageEnabled}
+                        onChange={(e) => setManualCoverPageEnabled(e.target.checked)}
+                        className="w-4 h-4 text-emerald-600 accent-emerald-600 rounded cursor-pointer"
+                      />
+                    </div>
+
+                    {manualCoverPageEnabled && (
+                      <div className="space-y-3 pt-2">
+                        <div className="space-y-1">
+                          <label className="text-xs font-semibold text-slate-600">Nom complet sur le dossier</label>
+                          <input
+                            type="text"
+                            value={manualCandidateName}
+                            onChange={(e) => setManualCandidateName(e.target.value)}
+                            className="w-full text-xs rounded-xl border border-slate-200 p-2.5 outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-xs font-semibold text-slate-600">Adresse de contact</label>
+                          <input
+                            type="email"
+                            value={manualCandidateEmail}
+                            onChange={(e) => setManualCandidateEmail(e.target.value)}
+                            className="w-full text-xs rounded-xl border border-slate-200 p-2.5 outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-xs font-semibold text-slate-600">Note introductive au jury</label>
+                          <textarea
+                            value={manualNotes}
+                            onChange={(e) => setManualNotes(e.target.value)}
+                            rows={3}
+                            placeholder="Ex: Je présente ma candidature respectueuse au poste..."
+                            className="w-full text-xs rounded-xl border border-slate-200 p-2.5 outline-none focus:border-indigo-500 placeholder:text-slate-400"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-xs font-semibold text-slate-600">Thème graphique</label>
+                          <div className="grid grid-cols-2 gap-2 mt-1">
+                            {[
+                              { id: 'classic', label: 'Bleu Classique', desc: 'Professionnel' },
+                              { id: 'modern', label: 'Moderne Ardoise', desc: 'Épuré' },
+                              { id: 'editorial', label: 'Académique Vert', desc: 'Sérieux' },
+                              { id: 'creative', label: 'Technique Violet', desc: 'Technique' },
+                            ].map((themeOpt) => (
+                              <button
+                                key={themeOpt.id}
+                                type="button"
+                                onClick={() => setManualCoverPageTheme(themeOpt.id)}
+                                className={`p-2 rounded-xl border text-left transition-all cursor-pointer flex flex-col ${
+                                  manualCoverPageTheme === themeOpt.id
+                                    ? 'border-emerald-600 bg-emerald-50/50 shadow-2xs'
+                                    : 'border-slate-200 hover:border-slate-300 bg-white'
+                                }`}
+                              >
+                                <span className={`text-[10px] font-bold ${manualCoverPageTheme === themeOpt.id ? 'text-emerald-700' : 'text-slate-800'}`}>
+                                  {themeOpt.label}
+                                </span>
+                                <span className="text-[8px] text-slate-400 font-medium leading-none mt-0.5">
+                                  {themeOpt.desc}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Estimated Pages for Manual (Always Free) */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-3xl p-5 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-medium text-slate-500">Formule Utilisateur :</span>
+                      <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-slate-900 text-white">
+                        Version Gratuite
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between border-t border-slate-200/60 pt-2.5">
+                      <span className="text-xs font-medium text-slate-500">Pages estimées :</span>
+                      <span className="text-xs font-bold text-slate-800">
+                        {getManualEstimatedPageCount()} page{getManualEstimatedPageCount() > 1 ? 's' : ''}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between border-t border-slate-200/60 pt-2.5">
+                      <span className="text-xs font-medium text-slate-500">Tarif de la fusion :</span>
+                      <span className="text-xs font-bold text-emerald-600 uppercase tracking-wider">
+                        100% GRATUIT & ILLIMITÉ
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Generate Button Card */}
+                  <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-xs space-y-4">
+                    <p className="text-xs text-slate-500 text-center leading-normal">
+                      Vérifiez votre sélection et l'ordre des pièces à droite avant de lancer la fusion.
+                    </p>
+                    <button
+                      onClick={handleGenerateManualDossier}
+                      disabled={generatingManualDossier || manualSelectedDocIds.length === 0}
+                      className="w-full py-4 rounded-2xl bg-slate-900 hover:bg-black text-white font-semibold flex items-center justify-center gap-2 transition-all shadow-md disabled:opacity-50 cursor-pointer text-sm"
+                    >
+                      {generatingManualDossier ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          <span>Assemblage en cours...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Layers className="w-4 h-4 text-emerald-400" />
+                          <span>Fusionner & Générer mon Dossier PDF</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Right Column: Piece Selector and Ordering */}
+                <div className="lg:col-span-2 space-y-6">
+                  {manualGenerationSuccess && (
+                    <div className="bg-emerald-50 border-2 border-emerald-500/20 p-6 rounded-3xl flex flex-col sm:flex-row items-center justify-between gap-4 shadow-sm">
+                      <div className="flex gap-3 items-start text-emerald-900">
+                        <CheckCircle2 className="w-10 h-10 text-emerald-600 flex-shrink-0" />
+                        <div>
+                          <span className="font-bold text-base block">Dossier de soumission PDF disponible !</span>
+                          <p className="text-xs text-emerald-700 mt-0.5">
+                            Vos pièces jointes ont été fusionnées selon l'ordre personnalisé que vous avez choisi.
+                          </p>
+                          <p className="text-[10px] text-emerald-600 mt-1">
+                            Taille finale : <strong>{(manualGenerationSuccess.size / 1024 / 1024).toFixed(2)} Mo</strong> • Pages : <strong>{manualGenerationSuccess.pageCount}</strong>
+                          </p>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={(e) => handleDownloadClick(e, manualGenerationSuccess.id, manualGenerationSuccess.title)}
+                        className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-6 rounded-2xl text-sm transition-all shadow-md shadow-emerald-100 cursor-pointer w-full sm:w-auto justify-center shrink-0"
+                      >
+                        <Download className="w-4 h-4" />
+                        Télécharger le dossier PDF
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-xs space-y-6">
+                    <div>
+                      <h3 className="font-display font-bold text-lg text-slate-900">1. Sélectionnez les pièces de votre Coffre-fort</h3>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Cochez manuellement chaque document que vous souhaitez inclure dans votre dossier de candidature.
+                      </p>
+                    </div>
+
+                    {safeDocs.length === 0 ? (
+                      <div className="p-8 text-center border border-dashed border-slate-200 rounded-2xl bg-slate-50/50 space-y-3">
+                        <p className="text-xs text-slate-500">Votre coffre-fort de fichiers est vide.</p>
+                        <button
+                          onClick={() => setActiveTab('safe')}
+                          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-xl cursor-pointer"
+                        >
+                          Uploader des documents
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {safeDocs.map((doc) => {
+                          const isSelected = manualSelectedDocIds.includes(doc.id);
+                          return (
+                            <div
+                              key={doc.id}
+                              onClick={() => toggleManualDocSelection(doc.id)}
+                              className={`p-3.5 rounded-xl border transition-all cursor-pointer flex items-center justify-between ${
+                                isSelected
+                                  ? 'border-emerald-500 bg-emerald-50/10'
+                                  : 'border-slate-100 bg-slate-50/30 hover:border-slate-200 hover:bg-slate-50/50'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 overflow-hidden pr-2">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={() => {}} // toggled on card click
+                                  className="w-4 h-4 text-emerald-600 accent-emerald-600 rounded cursor-pointer"
+                                />
+                                <div className="overflow-hidden">
+                                  <span className="font-semibold text-slate-900 text-xs truncate block">
+                                    {doc.originalName}
+                                  </span>
+                                  <span className="text-[9px] font-bold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded uppercase mt-1 inline-block">
+                                    {getCategoryLabel(doc.category)}
+                                  </span>
+                                </div>
+                              </div>
+                              <span className="text-[10px] text-slate-400 font-mono">
+                                {(doc.size / 1024 / 1024).toFixed(2)} Mo
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Ordering Step */}
+                  {manualSelectedDocIds.length > 0 && (
+                    <div className="bg-white rounded-3xl border border-slate-200 p-6 shadow-xs space-y-4">
+                      <div>
+                        <h3 className="font-display font-bold text-lg text-slate-900">2. Choisissez l'ordre des pièces</h3>
+                        <p className="text-xs text-slate-500 mt-1">
+                          Réorganisez l'ordre d'assemblage de vos documents à l'aide des flèches directionnelles.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {manualSelectedDocIds.map((id, index) => {
+                          const doc = safeDocs.find(d => d.id === id);
+                          if (!doc) return null;
+
+                          return (
+                            <div
+                              key={id}
+                              className="flex items-center justify-between p-3.5 bg-slate-50/50 border border-slate-150 rounded-xl"
+                            >
+                              <div className="flex items-center gap-3 overflow-hidden">
+                                <span className="w-5 h-5 rounded-full bg-slate-900 text-white font-mono text-[10px] font-bold flex items-center justify-center shrink-0">
+                                  {index + 1}
+                                </span>
+                                <div className="overflow-hidden">
+                                  <p className="text-xs font-semibold text-slate-900 truncate">{doc.originalName}</p>
+                                  <p className="text-[9px] text-slate-500 uppercase font-bold tracking-wider">
+                                    Catégorie : {getCategoryLabel(doc.category)}
+                                  </p>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => moveManualDocUp(index)}
+                                  disabled={index === 0}
+                                  className="p-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 disabled:opacity-40 cursor-pointer transition-colors"
+                                  title="Monter"
+                                >
+                                  ▲
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => moveManualDocDown(index)}
+                                  disabled={index === manualSelectedDocIds.length - 1}
+                                  className="p-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 disabled:opacity-40 cursor-pointer transition-colors"
+                                  title="Descendre"
+                                >
+                                  ▼
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
             {/* 2. ANALYSER UN APPEL TAB */}
             {activeTab === 'new-application' && (
               <motion.div
@@ -2209,6 +2766,49 @@ export default function App() {
                 exit={{ opacity: 0, y: -15 }}
                 className="max-w-3xl mx-auto space-y-8"
               >
+                {/* Premium Banner to showcase separation */}
+                {(user?.plan === 'free' || !user?.plan) && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-3xl p-6 shadow-xs space-y-3">
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-5 h-5 text-amber-500 animate-pulse" />
+                      <span className="font-bold text-amber-950 text-sm">Mode Premium IA disponible !</span>
+                    </div>
+                    <p className="text-xs text-amber-800 leading-normal">
+                      Vous utilisez actuellement la version gratuite. Le module <strong>Premium IA</strong> vous permet d'activer l'analyse de dossiers de recrutement automatisée. Voici ce qu'il inclut :
+                    </p>
+                    <ul className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-amber-900 mt-2">
+                      <li className="flex items-center gap-1.5">
+                        <Check className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Analyse intelligente de l'offre d'emploi</span>
+                      </li>
+                      <li className="flex items-center gap-1.5">
+                        <Check className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Détection automatique des pièces</span>
+                      </li>
+                      <li className="flex items-center gap-1.5">
+                        <Check className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Classement automatique dans le bon ordre</span>
+                      </li>
+                      <li className="flex items-center gap-1.5">
+                        <Check className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Lettre de motivation IA personnalisée</span>
+                      </li>
+                      <li className="flex items-center gap-1.5 md:col-span-2">
+                        <Check className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Vérification automatique des pièces administratives manquantes</span>
+                      </li>
+                    </ul>
+                    <div className="pt-2 flex justify-start">
+                      <button
+                        onClick={() => setShowUpgradeModal(true)}
+                        className="text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl transition-all shadow-xs cursor-pointer"
+                      >
+                        Passer au Plan Premium
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-xs">
                   <div className="text-center max-w-xl mx-auto space-y-2">
                     <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-3 py-1 rounded-full uppercase tracking-wider">
@@ -2625,6 +3225,46 @@ export default function App() {
                           </>
                         )}
                       </button>
+                    </div>
+                  </div>
+
+                  {/* Estimated Pages & Cost Upfront */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-3xl p-5 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-medium text-slate-500">Formule Utilisateur :</span>
+                      <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 capitalize">
+                        {user?.plan || 'Gratuit'}
+                      </span>
+                    </div>
+
+                    {(!user?.plan || user?.plan === 'free') && (
+                      <div className="flex items-center justify-between border-t border-slate-200/60 pt-2.5">
+                        <span className="text-xs font-medium text-slate-500">Essais Premium Gratuits :</span>
+                        <span className={`text-xs font-semibold ${getPremiumTrialsRemaining() > 0 ? 'text-emerald-600' : 'text-rose-500'}`}>
+                          {getPremiumTrialsRemaining()} / 3 restants
+                        </span>
+                      </div>
+                    )}
+
+                    <div className="flex items-center justify-between border-t border-slate-200/60 pt-2.5">
+                      <span className="text-xs font-medium text-slate-500">Pages estimées :</span>
+                      <span className="text-xs font-bold text-slate-800">
+                        {getPremiumEstimatedPageCount()} page{getPremiumEstimatedPageCount() > 1 ? 's' : ''}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between border-t border-slate-200/60 pt-2.5">
+                      <span className="text-xs font-medium text-slate-500">Tarif de la fusion :</span>
+                      <span className="text-sm font-black text-indigo-600">
+                        {isPremiumLimitReached() ? (
+                          <>
+                            {getPriceForPages(getPremiumEstimatedPageCount()).cfa} FCFA
+                            <span className="block text-[9px] text-slate-400 font-normal">Tarif {getPriceForPages(getPremiumEstimatedPageCount()).tier}</span>
+                          </>
+                        ) : (
+                          <span className="text-emerald-600">GRATUIT (Essai Premium)</span>
+                        )}
+                      </span>
                     </div>
                   </div>
 
@@ -3402,32 +4042,40 @@ export default function App() {
             <div className="overflow-y-auto pr-1 mt-4 sm:mt-6 flex-1">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pb-2">
                 
-                {/* Formule Gratuite (Essai) */}
+                {/* Formule Gratuite (Version Gratuite) */}
                 <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-5 flex flex-col justify-between transition-all">
                   <div>
-                    <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
-                      Mode Essai
+                    <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                      Version Gratuite
                     </span>
                     <div className="mt-3">
                       <span className="font-display font-extrabold text-2xl text-slate-900">Gratuit</span>
-                      <span className="text-slate-500 text-xs"> (3 essais offerts)</span>
+                      <span className="text-slate-500 text-xs"> (Illimité)</span>
                     </div>
-                    <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                      <li className="flex items-center gap-2">
-                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
-                        <strong>3 premiers téléchargements PDF 100% offerts</strong>
+                    <ul className="mt-4 space-y-3 text-xs text-slate-600">
+                      <li className="flex items-start gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Sélection manuelle :</strong> Cochez vous-même les pièces à inclure (CV, diplômes, attestations...).
+                        </div>
                       </li>
-                      <li className="flex items-center gap-2">
-                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
-                        Création libre de dossiers de soumission
+                      <li className="flex items-start gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Ordre sur-mesure :</strong> Organisez l'ordre de vos pièces de façon personnalisée.
+                        </div>
                       </li>
-                      <li className="flex items-center gap-2">
-                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
-                        Coffre-fort complet sécurisé
+                      <li className="flex items-start gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Assemblage automatique :</strong> Candia fusionne vos documents en un PDF unique et certifié.
+                        </div>
                       </li>
-                      <li className="flex items-center gap-2">
-                        <Check className="w-4 h-4 text-emerald-500 shrink-0" />
-                        Assistance IA et lettre de motivation
+                      <li className="flex items-start gap-2">
+                        <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Téléchargements :</strong> Téléchargement de vos dossiers assemblés 100% gratuit et illimité.
+                        </div>
                       </li>
                     </ul>
                   </div>
@@ -3436,41 +4084,71 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Mode Principal : Achat à l'acte */}
+                {/* Mode Principal : Version Premium IA */}
                 <div className="rounded-2xl border-2 border-indigo-600 bg-indigo-50/10 p-5 flex flex-col justify-between transition-all relative">
                   <div className="absolute top-4 right-4 bg-indigo-600 text-white font-bold text-[9px] uppercase tracking-wider px-3 py-1 rounded-full border border-indigo-500">
-                    Mode Principal 🚀
+                    Version Premium 🚀
                   </div>
                   <div>
                     <span className="text-[10px] font-bold text-indigo-700 bg-indigo-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
-                      Paiement à l'acte
+                      Intelligence Artificielle
                     </span>
                     <div className="mt-3">
-                      <span className="font-display font-extrabold text-xl text-slate-900">Pas d'abonnement</span>
-                      <span className="text-slate-500 text-xs block mt-0.5">Payez uniquement au téléchargement</span>
+                      <span className="font-display font-extrabold text-xl text-slate-900">Analyse & Automatisation</span>
+                      <span className="text-slate-500 text-xs block mt-0.5">Activation de l'IA pour vos candidatures</span>
                     </div>
                     
-                    <div className="mt-4 space-y-2">
-                      <div className="flex items-center justify-between text-xs border-b border-slate-100 pb-1.5">
-                        <span className="text-slate-600">Moins de 15 pages</span>
-                        <span className="font-bold text-slate-900">1 500 F CFA <span className="text-[10px] text-slate-400 font-normal">(~2.50$)</span></span>
+                    <ul className="mt-4 space-y-2.5 text-xs text-slate-600">
+                      <li className="flex items-start gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Analyse d'offre d'emploi :</strong> Lecture intelligente de l'offre par l'IA Gemini.
+                        </div>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Détection des pièces :</strong> Repérage automatique des justificatifs exigés.
+                        </div>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Classement IA :</strong> Tri intelligent dans l'ordre parfait requis par le recruteur.
+                        </div>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Lettre de motivation IA :</strong> Rédaction instantanée de votre lettre personnalisée.
+                        </div>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                        <div>
+                          <strong>Vérificateur de complétude :</strong> Alerte automatique si une pièce requise est manquante.
+                        </div>
+                      </li>
+                    </ul>
+                    
+                    <div className="mt-4 pt-4 border-t border-indigo-100/50 space-y-1.5">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Option de paiement :</span>
+                      <div className="flex items-center justify-between text-xs pb-1">
+                        <span className="text-slate-600">À l'acte (Moins de 15 p.)</span>
+                        <span className="font-bold text-slate-900">1 500 F CFA</span>
                       </div>
-                      <div className="flex items-center justify-between text-xs border-b border-slate-100 pb-1.5">
-                        <span className="text-slate-600">De 15 à 50 pages</span>
-                        <span className="font-bold text-slate-900">5 000 F CFA <span className="text-[10px] text-slate-400 font-normal">(~8.33$)</span></span>
+                      <div className="flex items-center justify-between text-xs pb-1">
+                        <span className="text-slate-600">À l'acte (15 à 50 p.)</span>
+                        <span className="font-bold text-slate-900">5 000 F CFA</span>
                       </div>
-                      <div className="flex items-center justify-between text-xs pb-0.5">
-                        <span className="text-slate-600">50 pages et plus</span>
-                        <span className="font-bold text-slate-900">10 000 F CFA <span className="text-[10px] text-slate-400 font-normal">(~16.67$)</span></span>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-600">À l'acte (50 p. et plus)</span>
+                        <span className="font-bold text-slate-900">10 000 F CFA</span>
                       </div>
                     </div>
-                    
-                    <p className="text-[10px] text-slate-500 mt-4 leading-normal">
-                      FedaPay prend en charge <strong>Orange Money, MTN Mobile Money, Wave, Moov</strong> et les cartes bancaires en toute sécurité.
-                    </p>
                   </div>
-                  <div className="mt-6 text-center text-xs font-semibold text-indigo-700 bg-indigo-50 py-2.5 rounded-xl border border-indigo-100">
-                    Paiement unitaire par dossier
+                  <div className="mt-5 text-center text-xs font-semibold text-indigo-700 bg-indigo-50 py-2.5 rounded-xl border border-indigo-100">
+                    Payez uniquement au téléchargement de vos dossiers
                   </div>
                 </div>
 

@@ -133,6 +133,19 @@ interface LocalDB {
     size: number;
     uploadedAt: string;
     path: string;
+    pageCount?: number;
+  }[];
+  draftDossiers?: {
+    id: string;
+    userId: string;
+    offerId: string;
+    coverPageOptions: any;
+    mappings: any;
+    signatureOptions: any;
+    createdAt: string;
+    estimatedPages: number;
+    manualTitle?: string;
+    manualOrganizer?: string;
   }[];
   offers: {
     id: string;
@@ -157,6 +170,8 @@ interface LocalDB {
     piecesIncluded: any[];
     hasCoverPage: boolean;
     status: 'success' | 'failed';
+    offerId?: string;
+    isManual?: boolean;
   }[];
   activityLogs: ActivityLog[];
 }
@@ -190,6 +205,7 @@ const DEFAULT_DB: LocalDB = {
     }
   ],
   documents: [],
+  draftDossiers: [],
   offers: [],
   dossiers: [],
   activityLogs: [],
@@ -695,7 +711,7 @@ app.get('/api/safe', (req, res) => {
   res.json(userDocs);
 });
 
-app.post('/api/safe/upload', upload.single('file'), (req, res) => {
+app.post('/api/safe/upload', upload.single('file'), async (req, res) => {
   try {
     const db = getDB();
 
@@ -746,6 +762,17 @@ app.post('/api/safe/upload', upload.single('file'), (req, res) => {
       });
     }
 
+    let pageCount = 1;
+    try {
+      if (req.file.mimetype === 'application/pdf') {
+        const fileBuffer = fs.readFileSync(req.file.path);
+        const pdfDoc = await PDFDocument.load(fileBuffer);
+        pageCount = pdfDoc.getPageCount();
+      }
+    } catch (e) {
+      console.error('Error extracting PDF page count in upload:', e);
+    }
+
     const newDoc = {
       id: `doc_${Date.now()}`,
       userId: db.user.id,
@@ -755,6 +782,7 @@ app.post('/api/safe/upload', upload.single('file'), (req, res) => {
       size: req.file.size,
       uploadedAt: new Date().toISOString(),
       path: req.file.path,
+      pageCount: pageCount,
     };
 
     db.documents.push(newDoc);
@@ -1144,6 +1172,14 @@ app.post('/api/safe/save-text', async (req, res) => {
     // Write physical file
     fs.writeFileSync(filePath, pdfBuffer);
 
+    let pageCount = 1;
+    try {
+      const pdfDoc = await PDFDocument.load(pdfBuffer);
+      pageCount = pdfDoc.getPageCount();
+    } catch (e) {
+      console.error('Error extracting PDF page count in save-text:', e);
+    }
+
     const newDoc = {
       id: `doc_${Date.now()}`,
       userId: db.user.id,
@@ -1153,6 +1189,7 @@ app.post('/api/safe/save-text', async (req, res) => {
       size: pdfBuffer.length,
       uploadedAt: new Date().toISOString(),
       path: filePath,
+      pageCount: pageCount,
     };
 
     db.documents.push(newDoc);
@@ -1411,395 +1448,478 @@ function generateSimulatedAnalysis(text: string): any {
   };
 }
 
+// 4. Unified physical PDF Dossier Generation helper function
+async function executePhysicalDossierGeneration(
+  targetUserId: string,
+  offerId: string,
+  coverPageOptions: any,
+  mappings: any[],
+  signatureOptions: any,
+  manualTitle?: string,
+  manualOrganizer?: string
+): Promise<any> {
+  const db = getDB();
+
+  let offer;
+  if (offerId === 'manual') {
+    offer = {
+      id: 'manual',
+      title: manualTitle || 'Dossier de Candidature Manuel',
+      organizer: manualOrganizer || 'Candidature Spontanée / Libre',
+      deadline: 'Non spécifiée',
+      extractedPieces: []
+    };
+  } else {
+    offer = db.offers.find((off) => off.id === offerId);
+  }
+  
+  if (!offer) {
+    throw new Error('Appel d\'offre introuvable');
+  }
+
+  // Load actual physical files from safe documents based on mappings
+  const finalMergeFiles: { path: string; mimeType: string; originalName: string; category: string }[] = [];
+  const piecesIncludedMetadata: any[] = [];
+
+  // Sort mappings by specified order
+  const sortedMappings = [...mappings].sort((a, b) => a.ordre - b.ordre);
+
+  for (const mapItem of sortedMappings) {
+    if (!mapItem.documentId) continue; // Skip missing pieces
+
+    const safeDoc = db.documents.find((doc) => doc.id === mapItem.documentId);
+    if (safeDoc) {
+      if (fs.existsSync(safeDoc.path)) {
+        finalMergeFiles.push({
+          path: safeDoc.path,
+          mimeType: safeDoc.mimeType,
+          originalName: safeDoc.originalName,
+          category: safeDoc.category,
+        });
+      }
+    }
+  }
+
+  if (finalMergeFiles.length === 0) {
+    throw new Error('Aucun document valide n\'a été sélectionné pour la fusion.');
+  }
+
+  // Perform physical PDF generation/merge using pdf-lib
+  const mergedPdf = await PDFDocument.create();
+  
+  // First, compile each input file into a PDF representation
+  const compiledDocs: { doc: PDFDocument; name: string; category: string }[] = [];
+  
+  for (const file of finalMergeFiles) {
+    try {
+      const fileBuffer = fs.readFileSync(file.path);
+      const doc = await getPdfDocumentOfFile(fileBuffer, file.mimeType);
+      compiledDocs.push({
+        doc,
+        name: file.originalName,
+        category: file.category,
+      });
+    } catch (err) {
+      console.error(`Failed to process file ${file.originalName}:`, err);
+    }
+  }
+
+  if (compiledDocs.length === 0) {
+    throw new Error('Échec lors de la conversion des pièces jointes en PDF.');
+  }
+
+  const coverPageEnabled = coverPageOptions && coverPageOptions.enabled;
+  let currentPageNum = coverPageEnabled ? 2 : 1;
+  const tableOfContents: { label: string; page: number }[] = [];
+
+  // Precalculate Table of Contents page indices
+  for (const cDoc of compiledDocs) {
+    const pageCount = cDoc.doc.getPageCount();
+    tableOfContents.push({
+      label: `${getCategoryLabel(cDoc.category)} - ${cDoc.name}`,
+      page: currentPageNum,
+    });
+    piecesIncludedMetadata.push({
+      nomOriginal: getCategoryLabel(cDoc.category),
+      categorie: cDoc.category,
+      fileName: cDoc.name,
+      pageCount: pageCount,
+    });
+    currentPageNum += pageCount;
+  }
+
+  // Draw Cover Page if enabled
+  if (coverPageEnabled) {
+    const coverPage = mergedPdf.addPage([595.276, 841.89]); // A4 in points
+    const { width, height } = coverPage.getSize();
+
+    const coverTheme = coverPageOptions.theme || 'classic';
+
+    let regularFontName = StandardFonts.Helvetica;
+    let boldFontName = StandardFonts.HelveticaBold;
+    let primaryColor = rgb(0.12, 0.43, 0.84); // Classic Navy Blue
+    let secondaryColor = rgb(0.4, 0.4, 0.4);
+    let titleColor = rgb(0.08, 0.12, 0.2);
+
+    if (coverTheme === 'modern') {
+      regularFontName = StandardFonts.Helvetica;
+      boldFontName = StandardFonts.HelveticaBold;
+      primaryColor = rgb(0.08, 0.12, 0.2); // Slate / Charcoal
+      secondaryColor = rgb(0.3, 0.4, 0.5);
+      titleColor = rgb(0.1, 0.15, 0.25);
+    } else if (coverTheme === 'editorial') {
+      regularFontName = StandardFonts.TimesRoman;
+      boldFontName = StandardFonts.TimesRomanBold;
+      primaryColor = rgb(0.48, 0.24, 0.08); // Warm Terracotta / Editorial Brown
+      secondaryColor = rgb(0.4, 0.4, 0.4);
+      titleColor = rgb(0.2, 0.1, 0.05);
+    } else if (coverTheme === 'creative') {
+      regularFontName = StandardFonts.Courier;
+      boldFontName = StandardFonts.CourierBold;
+      primaryColor = rgb(0.55, 0.1, 0.65); // Creative Deep Purple
+      secondaryColor = rgb(0.4, 0.4, 0.4);
+      titleColor = rgb(0.3, 0.05, 0.35);
+    }
+
+    const helveticaBold = await mergedPdf.embedFont(boldFontName);
+    const helvetica = await mergedPdf.embedFont(regularFontName);
+
+    // Theme-specific background/decorations
+    if (coverTheme === 'classic') {
+      coverPage.drawRectangle({
+        x: 0,
+        y: height - 15,
+        width,
+        height: 15,
+        color: primaryColor,
+      });
+    } else if (coverTheme === 'modern') {
+      coverPage.drawLine({
+        start: { x: 30, y: height - 40 },
+        end: { x: 30, y: 40 },
+        thickness: 2,
+        color: primaryColor,
+      });
+    } else if (coverTheme === 'editorial') {
+      coverPage.drawRectangle({
+        x: 30,
+        y: 30,
+        width: width - 60,
+        height: height - 60,
+        borderColor: primaryColor,
+        borderWidth: 1.5,
+      });
+      coverPage.drawRectangle({
+        x: 34,
+        y: 34,
+        width: width - 68,
+        height: height - 68,
+        borderColor: primaryColor,
+        borderWidth: 0.5,
+      });
+    } else if (coverTheme === 'creative') {
+      coverPage.drawRectangle({
+        x: 0,
+        y: height - 20,
+        width: 35,
+        height: 20,
+        color: primaryColor,
+      });
+      coverPage.drawRectangle({
+        x: 45,
+        y: height - 20,
+        width: width - 90,
+        height: 4,
+        color: secondaryColor,
+      });
+    }
+
+    // Title Section
+    coverPage.drawText('DOSSIER DE SOUMISSION', {
+      x: 55,
+      y: height - 100,
+      size: 13,
+      font: helveticaBold,
+      color: secondaryColor,
+    });
+
+    coverPage.drawText(offer.title.substring(0, 50), {
+      x: 55,
+      y: height - 150,
+      size: 24,
+      font: helveticaBold,
+      color: titleColor,
+    });
+
+    coverPage.drawText(`Destinataire : ${offer.organizer}`, {
+      x: 55,
+      y: height - 185,
+      size: 13,
+      font: helvetica,
+      color: secondaryColor,
+    });
+
+    coverPage.drawLine({
+      start: { x: 55, y: height - 210 },
+      end: { x: width - 55, y: height - 210 },
+      thickness: 1,
+      color: rgb(0.8, 0.8, 0.8),
+    });
+
+    // Candidate Metadata
+    coverPage.drawText('INFORMATIONS DU CANDIDAT', {
+      x: 55,
+      y: height - 250,
+      size: 11,
+      font: helveticaBold,
+      color: primaryColor,
+    });
+
+    const targetUser = db.users.find(u => u.id === targetUserId) || db.user;
+    const candName = coverPageOptions.candidateName || targetUser.name;
+    const candEmail = coverPageOptions.candidateEmail || targetUser.email;
+
+    coverPage.drawText(`Nom complet : ${candName}`, { x: 55, y: height - 275, size: 11, font: helvetica });
+    coverPage.drawText(`Adresse Email : ${candEmail}`, { x: 55, y: height - 295, size: 11, font: helvetica });
+    coverPage.drawText(`Date de génération : ${new Date().toLocaleDateString('fr-FR')}`, { x: 55, y: height - 315, size: 11, font: helvetica });
+    if (offer.deadline && offer.deadline !== 'Non spécifiée') {
+      coverPage.drawText(`Date Limite de l'offre : ${offer.deadline}`, { x: 55, y: height - 335, size: 11, font: helvetica, color: rgb(0.8, 0.2, 0.2) });
+    }
+
+    // Notes / Summary Statement
+    if (coverPageOptions.notes) {
+      coverPage.drawText('NOTE DE SYNTHÈSE', { x: 55, y: height - 380, size: 11, font: helveticaBold, color: primaryColor });
+      const noteText = coverPageOptions.notes.substring(0, 180);
+      coverPage.drawText(noteText, { x: 55, y: height - 405, size: 10, font: helvetica, color: secondaryColor });
+    }
+
+    // Table of Contents Section
+    coverPage.drawText('SOMMAIRE DES PIÈCES JOINTES', {
+      x: 55,
+      y: height - 480,
+      size: 11,
+      font: helveticaBold,
+      color: titleColor,
+    });
+
+    coverPage.drawLine({
+      start: { x: 55, y: height - 490 },
+      end: { x: width - 55, y: height - 490 },
+      thickness: 1,
+      color: rgb(0.8, 0.8, 0.8),
+    });
+
+    let currentY = height - 515;
+    for (const tocItem of tableOfContents) {
+      coverPage.drawText(tocItem.label.substring(0, 70), { x: 60, y: currentY, size: 9, font: helvetica, color: titleColor });
+      
+      // Draw dotted connector line
+      const textWidth = helvetica.widthOfTextAtSize(tocItem.label.substring(0, 70), 9);
+      coverPage.drawText('. '.repeat(Math.max(5, Math.floor((width - 130 - textWidth) / 4))), { x: 65 + textWidth, y: currentY, size: 8, font: helvetica, color: rgb(0.7, 0.7, 0.7) });
+      
+      coverPage.drawText(`Page ${tocItem.page}`, { x: width - 95, y: currentY, size: 9, font: helveticaBold, color: primaryColor });
+      currentY -= 18;
+    }
+  }
+
+  // Merge Compiled documents
+  for (const cDoc of compiledDocs) {
+    const copiedPages = await mergedPdf.copyPages(cDoc.doc, cDoc.doc.getPageIndices());
+    copiedPages.forEach((page) => mergedPdf.addPage(page));
+  }
+
+  // Embed Signature if enabled
+  if (signatureOptions && signatureOptions.enabled) {
+    const signatureDoc = db.documents.find((d) => d.category === 'SIGNATURE' && d.userId === targetUserId);
+    if (signatureDoc && fs.existsSync(signatureDoc.path)) {
+      try {
+        const sigBytes = fs.readFileSync(signatureDoc.path);
+        let embeddedSigImg;
+        if (signatureDoc.mimeType === 'image/png') {
+          embeddedSigImg = await mergedPdf.embedPng(sigBytes);
+        } else {
+          embeddedSigImg = await mergedPdf.embedJpg(sigBytes);
+        }
+
+        const pagesCount = mergedPdf.getPageCount();
+        let targetSigPageIndex = pagesCount - 1; // Default last page
+        if (signatureOptions.pageIndex > 0 && signatureOptions.pageIndex < pagesCount) {
+          targetSigPageIndex = signatureOptions.pageIndex;
+        }
+
+        const targetPage = mergedPdf.getPage(targetSigPageIndex);
+
+        // Coordinates resolution
+        let x = signatureOptions.x || 420;
+        let y = signatureOptions.y || 110;
+        const w = signatureOptions.width || 120;
+        const h = signatureOptions.height || 60;
+
+        // Draw the signature
+        targetPage.drawImage(embeddedSigImg, {
+          x,
+          y,
+          width: w,
+          height: h,
+        });
+      } catch (e) {
+        console.error('Error drawing auto-signature:', e);
+      }
+    }
+  }
+
+  // Save compiled PDF bytes
+  const finalFilename = `dossier_compilation_${Date.now()}_${targetUserId}.pdf`;
+  const finalPath = path.join(DOSSIERS_DIR, finalFilename);
+  const mergedBytes = await mergedPdf.save();
+  fs.writeFileSync(finalPath, mergedBytes);
+
+  // Update monthly usage counter
+  const sessionUser = db.users.find(u => u.id === targetUserId);
+  if (sessionUser) {
+    sessionUser.monthlyDossiersCreated += 1;
+  }
+  if (db.user && db.user.id === targetUserId) {
+    db.user.monthlyDossiersCreated += 1;
+  }
+
+  const finalPageCount = mergedPdf.getPageCount();
+
+  // Save to generated dossiers history list
+  const newDossier = {
+    id: `dossier_${Date.now()}`,
+    userId: targetUserId,
+    title: offer.title,
+    organizer: offer.organizer,
+    createdAt: new Date().toISOString(),
+    pdfPath: finalFilename,
+    size: mergedBytes.length,
+    pageCount: finalPageCount,
+    piecesIncluded: piecesIncludedMetadata,
+    hasCoverPage: coverPageEnabled,
+    status: 'success' as const,
+    offerId: offerId,
+    isManual: offerId === 'manual',
+  };
+
+  db.dossiers.push(newDossier);
+  saveDB(db);
+
+  // Sync to Firestore
+  saveEntityToFirestore('dossiers', newDossier.id, newDossier).catch(err => {
+    console.error('Error syncing dossier to Firestore:', err);
+  });
+  if (sessionUser) {
+    saveEntityToFirestore('users', sessionUser.id, sessionUser).catch(err => {
+      console.error('Error syncing users counters to Firestore:', err);
+    });
+  }
+
+  return newDossier;
+}
+
+// Draft Creation Endpoint
+app.post('/api/dossiers/create-draft', async (req, res) => {
+  try {
+    const { offerId, coverPageOptions, mappings, signatureOptions, manualTitle, manualOrganizer } = req.body;
+    if (!offerId || !mappings || !Array.isArray(mappings)) {
+      return res.status(400).json({ error: 'Données de brouillon incomplètes' });
+    }
+
+    const db = getDB();
+    if (!db.user || db.user.id === 'guest') {
+      return res.status(401).json({ error: 'Connexion requise pour sauvegarder un brouillon.' });
+    }
+
+    // Calculate estimated page count
+    let estimatedPages = (coverPageOptions && coverPageOptions.enabled) ? 1 : 0;
+    mappings.forEach((m: any) => {
+      if (m.documentId) {
+        const doc = db.documents.find((d) => d.id === m.documentId);
+        if (doc) {
+          estimatedPages += doc.pageCount || 1;
+        }
+      }
+    });
+
+    // Calculate pricing based on pages count
+    let costCFA = 1500;
+    let costUSD = 2.5;
+    if (estimatedPages >= 15 && estimatedPages <= 50) {
+      costCFA = 5000;
+      costUSD = 8.33;
+    } else if (estimatedPages > 50) {
+      costCFA = 10000;
+      costUSD = 16.67;
+    }
+
+    const draftId = `draft_${Date.now()}`;
+    const newDraft = {
+      id: draftId,
+      userId: db.user.id,
+      offerId,
+      coverPageOptions,
+      mappings,
+      signatureOptions,
+      createdAt: new Date().toISOString(),
+      estimatedPages,
+      manualTitle,
+      manualOrganizer
+    };
+
+    if (!db.draftDossiers) {
+      db.draftDossiers = [];
+    }
+    db.draftDossiers.push(newDraft);
+    saveDB(db);
+
+    res.json({
+      success: true,
+      draftDossierId: draftId,
+      estimatedPages,
+      costCFA,
+      costUSD
+    });
+  } catch (error: any) {
+    console.error('Error creating draft dossier:', error);
+    res.status(500).json({ error: error.message || 'Une erreur est survenue lors de la création du brouillon.' });
+  }
+});
+
 // 4. Dossier Generation (PDF Merge)
 app.post('/api/dossiers/generate', async (req, res) => {
   try {
-    const { offerId, coverPageOptions, mappings, signatureOptions } = req.body;
+    const { offerId, coverPageOptions, mappings, signatureOptions, manualTitle, manualOrganizer } = req.body;
     if (!offerId || !mappings || !Array.isArray(mappings)) {
       return res.status(400).json({ error: 'Données de génération incomplètes' });
     }
 
     const db = getDB();
-
-    // Check plan limits - allowed freely now, payment is at download
-    const currentPlan = db.user.plan;
-
-    const offer = db.offers.find((off) => off.id === offerId);
-    if (!offer) {
-      return res.status(404).json({ error: 'Appel d\'offre introuvable' });
+    if (!db.user || db.user.id === 'guest') {
+      return res.status(401).json({ error: 'Inscription ou connexion requise.' });
     }
 
-    // Load actual physical files from safe documents based on mappings
-    const finalMergeFiles: { path: string; mimeType: string; originalName: string; category: string }[] = [];
-    const piecesIncludedMetadata: any[] = [];
+    // Call physical generator helper
+    const newDossier = await executePhysicalDossierGeneration(
+      db.user.id,
+      offerId,
+      coverPageOptions,
+      mappings,
+      signatureOptions,
+      manualTitle,
+      manualOrganizer
+    );
 
-    // Sort mappings by specified order
-    const sortedMappings = [...mappings].sort((a, b) => a.ordre - b.ordre);
-
-    for (const mapItem of sortedMappings) {
-      if (!mapItem.documentId) continue; // Skip missing pieces
-
-      const safeDoc = db.documents.find((doc) => doc.id === mapItem.documentId);
-      if (safeDoc) {
-        if (fs.existsSync(safeDoc.path)) {
-          finalMergeFiles.push({
-            path: safeDoc.path,
-            mimeType: safeDoc.mimeType,
-            originalName: safeDoc.originalName,
-            category: safeDoc.category,
-          });
-        }
-      }
-    }
-
-    if (finalMergeFiles.length === 0) {
-      return res.status(400).json({ error: 'Aucun document valide n\'a été sélectionné pour la fusion.' });
-    }
-
-    // Let's perform physical PDF generation/merge using pdf-lib
-    const mergedPdf = await PDFDocument.create();
-    
-    // First, compile each input file into a PDF representation to compute accurate table of contents pages!
-    const compiledDocs: { doc: PDFDocument; name: string; category: string }[] = [];
-    
-    for (const file of finalMergeFiles) {
-      try {
-        const fileBuffer = fs.readFileSync(file.path);
-        const doc = await getPdfDocumentOfFile(fileBuffer, file.mimeType);
-        compiledDocs.push({
-          doc,
-          name: file.originalName,
-          category: file.category,
-        });
-      } catch (err) {
-        console.error(`Failed to process file ${file.originalName}:`, err);
-      }
-    }
-
-    if (compiledDocs.length === 0) {
-      return res.status(500).json({ error: 'Échec lors de la conversion des pièces jointes en PDF.' });
-    }
-
-    const coverPageEnabled = coverPageOptions && coverPageOptions.enabled;
-    let currentPageNum = coverPageEnabled ? 2 : 1;
-    const tableOfContents: { label: string; page: number }[] = [];
-
-    // Precalculate Table of Contents page indices
-    for (const cDoc of compiledDocs) {
-      const pageCount = cDoc.doc.getPageCount();
-      tableOfContents.push({
-        label: `${getCategoryLabel(cDoc.category)} - ${cDoc.name}`,
-        page: currentPageNum,
-      });
-      piecesIncludedMetadata.push({
-        nomOriginal: getCategoryLabel(cDoc.category),
-        categorie: cDoc.category,
-        fileName: cDoc.name,
-        pageCount: pageCount,
-      });
-      currentPageNum += pageCount;
-    }
-
-    // 1. Draw Cover Page if enabled
-    if (coverPageEnabled) {
-      const coverPage = mergedPdf.addPage([595.276, 841.89]); // A4 in points
-      const { width, height } = coverPage.getSize();
-
-      const coverTheme = coverPageOptions.theme || 'classic';
-
-      let regularFontName = StandardFonts.Helvetica;
-      let boldFontName = StandardFonts.HelveticaBold;
-      let primaryColor = rgb(0.12, 0.43, 0.84); // Classic Navy Blue
-      let secondaryColor = rgb(0.4, 0.4, 0.4);
-      let titleColor = rgb(0.08, 0.12, 0.2);
-
-      if (coverTheme === 'modern') {
-        regularFontName = StandardFonts.Helvetica;
-        boldFontName = StandardFonts.HelveticaBold;
-        primaryColor = rgb(0.08, 0.12, 0.2); // Slate / Charcoal
-        secondaryColor = rgb(0.3, 0.4, 0.5);
-        titleColor = rgb(0.1, 0.15, 0.25);
-      } else if (coverTheme === 'editorial') {
-        regularFontName = StandardFonts.TimesRoman;
-        boldFontName = StandardFonts.TimesRomanBold;
-        primaryColor = rgb(0.48, 0.24, 0.08); // Warm Terracotta / Editorial Brown
-        secondaryColor = rgb(0.4, 0.4, 0.4);
-        titleColor = rgb(0.2, 0.1, 0.05);
-      } else if (coverTheme === 'creative') {
-        regularFontName = StandardFonts.Courier;
-        boldFontName = StandardFonts.CourierBold;
-        primaryColor = rgb(0.55, 0.1, 0.65); // Creative Deep Purple
-        secondaryColor = rgb(0.4, 0.4, 0.4);
-        titleColor = rgb(0.3, 0.05, 0.35);
-      }
-
-      const helveticaBold = await mergedPdf.embedFont(boldFontName);
-      const helvetica = await mergedPdf.embedFont(regularFontName);
-
-      // Theme-specific background/decorations
-      if (coverTheme === 'classic') {
-        // Top decorative bar
-        coverPage.drawRectangle({
-          x: 0,
-          y: height - 15,
-          width,
-          height: 15,
-          color: primaryColor,
-        });
-      } else if (coverTheme === 'modern') {
-        // Left side vertical line accent
-        coverPage.drawLine({
-          start: { x: 30, y: height - 40 },
-          end: { x: 30, y: 40 },
-          thickness: 2,
-          color: primaryColor,
-        });
-      } else if (coverTheme === 'editorial') {
-        // Double border box framing
-        coverPage.drawRectangle({
-          x: 30,
-          y: 30,
-          width: width - 60,
-          height: height - 60,
-          borderColor: primaryColor,
-          borderWidth: 1.5,
-        });
-        coverPage.drawRectangle({
-          x: 34,
-          y: 34,
-          width: width - 68,
-          height: height - 68,
-          borderColor: primaryColor,
-          borderWidth: 0.5,
-        });
-      } else if (coverTheme === 'creative') {
-        // Top modern accent block
-        coverPage.drawRectangle({
-          x: 0,
-          y: height - 20,
-          width: 35,
-          height: 20,
-          color: primaryColor,
-        });
-        coverPage.drawRectangle({
-          x: 45,
-          y: height - 20,
-          width: width - 90,
-          height: 4,
-          color: secondaryColor,
-        });
-      }
-
-      // Title Section
-      coverPage.drawText('DOSSIER DE SOUMISSION', {
-        x: 55,
-        y: height - 100,
-        size: 13,
-        font: helveticaBold,
-        color: secondaryColor,
-      });
-
-      coverPage.drawText(offer.title.substring(0, 50), {
-        x: 55,
-        y: height - 150,
-        size: 24,
-        font: helveticaBold,
-        color: titleColor,
-      });
-
-      coverPage.drawText(`Destinataire : ${offer.organizer}`, {
-        x: 55,
-        y: height - 185,
-        size: 13,
-        font: helvetica,
-        color: secondaryColor,
-      });
-
-      // Horizontal separator line
-      coverPage.drawLine({
-        start: { x: 55, y: height - 210 },
-        end: { x: width - 55, y: height - 210 },
-        thickness: 1,
-        color: rgb(0.8, 0.8, 0.8),
-      });
-
-      // Candidate Metadata
-      coverPage.drawText('INFORMATIONS DU CANDIDAT', {
-        x: 55,
-        y: height - 250,
-        size: 11,
-        font: helveticaBold,
-        color: primaryColor,
-      });
-
-      const candName = coverPageOptions.candidateName || db.user.name;
-      const candEmail = coverPageOptions.candidateEmail || db.user.email;
-
-      coverPage.drawText(`Nom complet : ${candName}`, { x: 55, y: height - 275, size: 11, font: helvetica });
-      coverPage.drawText(`Adresse Email : ${candEmail}`, { x: 55, y: height - 295, size: 11, font: helvetica });
-      coverPage.drawText(`Date de génération : ${new Date().toLocaleDateString('fr-FR')}`, { x: 55, y: height - 315, size: 11, font: helvetica });
-      if (offer.deadline && offer.deadline !== 'Non spécifiée') {
-        coverPage.drawText(`Date Limite de l'offre : ${offer.deadline}`, { x: 55, y: height - 335, size: 11, font: helvetica, color: rgb(0.8, 0.2, 0.2) });
-      }
-
-      // Notes / Summary Statement
-      if (coverPageOptions.notes) {
-        coverPage.drawText('NOTE DE SYNTHÈSE', { x: 55, y: height - 380, size: 11, font: helveticaBold, color: primaryColor });
-        const noteText = coverPageOptions.notes.substring(0, 180);
-        coverPage.drawText(noteText, { x: 55, y: height - 405, size: 10, font: helvetica, color: secondaryColor });
-      }
-
-      // Table of Contents Section
-      coverPage.drawText('SOMMAIRE DES PIÈCES JOINTES', {
-        x: 55,
-        y: height - 480,
-        size: 11,
-        font: helveticaBold,
-        color: titleColor,
-      });
-
-      coverPage.drawLine({
-        start: { x: 55, y: height - 490 },
-        end: { x: width - 55, y: height - 490 },
-        thickness: 1,
-        color: rgb(0.8, 0.8, 0.8),
-      });
-
-      let tocY = height - 520;
-      for (const item of tableOfContents) {
-        coverPage.drawText(item.label.substring(0, 65), {
-          x: 60,
-          y: tocY,
-          size: 9,
-          font: helvetica,
-          color: rgb(0.2, 0.2, 0.2),
-        });
-
-        // Draw dynamic dotted leader lines
-        coverPage.drawText('. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .', {
-          x: 280,
-          y: tocY,
-          size: 8,
-          font: helvetica,
-          color: rgb(0.6, 0.6, 0.6),
-        });
-
-        coverPage.drawText(`Page ${item.page}`, {
-          x: width - 100,
-          y: tocY,
-          size: 10,
-          font: helveticaBold,
-          color: primaryColor,
-        });
-
-        tocY -= 22;
-      }
-
-      // Brand Footer
-      coverPage.drawText('Généré de manière certifiée par l\'application Candia SaaS.', {
-        x: 55,
-        y: 40,
-        size: 8,
-        font: helvetica,
-        color: rgb(0.6, 0.6, 0.6),
-      });
-    }
-
-    // 2. Append all compiled PDF documents
-    for (const cDoc of compiledDocs) {
-      const copiedPages = await mergedPdf.copyPages(cDoc.doc, cDoc.doc.getPageIndices());
-      copiedPages.forEach((page) => mergedPdf.addPage(page));
-    }
-
-    // 3. Auto Signature insertion if enabled
-    if (signatureOptions && signatureOptions.enabled) {
-      const sigDoc = db.documents.find(d => d.category === 'SIGNATURE');
-      if (sigDoc && fs.existsSync(sigDoc.path)) {
-        try {
-          const sigBytes = fs.readFileSync(sigDoc.path);
-          const sigImg = sigDoc.mimeType === 'image/png' ? await mergedPdf.embedPng(sigBytes) : await mergedPdf.embedJpg(sigBytes);
-          
-          // Use manual selected coordinates, or try auto keywords scanning placement on motivation letter or last page
-          // coordinates default: relative bottom-right
-          const targetPageIndex = signatureOptions.pageIndex ?? (mergedPdf.getPageCount() - 1);
-          const targetPage = mergedPdf.getPages()[targetPageIndex];
-          if (targetPage) {
-            // Standard aesthetic box for a balanced layout: Max Width 130 pt, Max Height 60 pt
-            const maxWidth = 130;
-            const maxHeight = 60;
-            
-            let sigWidth = sigImg.width;
-            let sigHeight = sigImg.height;
-            
-            // Calculate proportional ratio to fit without stretching
-            const ratio = Math.min(maxWidth / sigWidth, maxHeight / sigHeight);
-            sigWidth = sigWidth * ratio;
-            sigHeight = sigHeight * ratio;
-            
-            // Draw visual signature
-            targetPage.drawImage(sigImg, {
-              x: signatureOptions.x ?? (targetPage.getWidth() - sigWidth - 50),
-              y: signatureOptions.y ?? 100,
-              width: sigWidth,
-              height: sigHeight,
-            });
-          }
-        } catch (sigErr) {
-          console.error('Failed to embed signature onto PDF document:', sigErr);
-        }
-      }
-    }
-
-    // Save final combined PDF
-    const finalFilename = `dossier_${Date.now()}.pdf`;
-    const finalPath = path.join(DOSSIERS_DIR, finalFilename);
-    const mergedBytes = await mergedPdf.save();
-    fs.writeFileSync(finalPath, mergedBytes);
-
-    // Update monthly usage counter
-    db.user.monthlyDossiersCreated += 1;
-    const sessionUser = db.users.find(u => u.id === db.user.id);
-    if (sessionUser) {
-      sessionUser.monthlyDossiersCreated += 1;
-    }
-
-    const pageCount = mergedPdf.getPageCount();
-
-    // Save to generated dossiers history list
-    const newDossier = {
-      id: `dossier_${Date.now()}`,
-      userId: db.user.id,
-      title: offer.title,
-      organizer: offer.organizer,
-      createdAt: new Date().toISOString(),
-      pdfPath: finalFilename,
-      size: mergedBytes.length,
-      pageCount: pageCount,
-      piecesIncluded: piecesIncludedMetadata,
-      hasCoverPage: coverPageEnabled,
-      status: 'success' as const,
-    };
-
-    db.dossiers.push(newDossier);
-    saveDB(db);
-    saveEntityToFirestore('dossiers', newDossier.id, newDossier).catch(err => {
-      console.error('Error syncing dossier to Firestore:', err);
-    });
-    if (sessionUser) {
-      saveEntityToFirestore('users', sessionUser.id, sessionUser).catch(err => {
-        console.error('Error syncing user' + 's counters to Firestore:', err);
-      });
-    }
-
-    const payDetail = (currentPlan === 'free' && req.body.isPaidUnit) ? ' (Paiement à l\'unité de 2 000 FCFA)' : '';
-    logActivity(db.user.id, db.user.email, 'GENERATE', `Génération de dossier PDF de soumission : ${offer.title}${payDetail}`, db.user.country || 'Sénégal', 0);
+    const payDetail = (db.user.plan === 'free' && req.body.isPaidUnit) ? ' (Paiement à l\'unité)' : '';
+    logActivity(db.user.id, db.user.email, 'GENERATE', `Génération de dossier PDF de soumission : ${newDossier.title}${payDetail}`, db.user.country || 'Sénégal', 0);
 
     res.json({ success: true, dossier: newDossier });
-  } catch (error) {
+  } catch (error: any) {
     console.error('PDF Generation endpoint error:', error);
-    res.status(500).json({ error: 'Une erreur technique est survenue lors de la fusion du dossier de soumission PDF.' });
+    res.status(500).json({ error: error.message || 'Une erreur technique est survenue lors de la fusion du dossier de soumission PDF.' });
   }
 });
+
 
 // Helper category label translation
 function getCategoryLabel(category: string): string {
@@ -2144,9 +2264,18 @@ app.get('/api/dossiers/check-download/:id', (req, res) => {
     return res.json({ allowed: true });
   }
 
-  // Check if free demo download is still available (exactly 3 free PDF demo downloads)
-  const downloadedCount = user?.downloadedDossiers?.length || 0;
-  if (downloadedCount < 3) {
+  // If the dossier is manual (generated via manual-generator / Version Gratuite), it is always allowed for download with no limit
+  if (dossier.isManual || dossier.offerId === 'manual' || dossier.organizer === 'Candidature Spontanée / Libre') {
+    return res.json({ allowed: true, isFreeManual: true });
+  }
+
+  // Check if free demo download is still available (exactly 3 free PDF demo downloads) for premium dossiers
+  const downloadedPremiumCount = user?.downloadedDossiers?.filter(id => {
+    const d = db.dossiers.find(x => x.id === id);
+    return d && d.offerId !== 'manual';
+  }).length || 0;
+
+  if (downloadedPremiumCount < 3) {
     return res.json({ allowed: true, isFreeDemo: true });
   }
 
@@ -2285,10 +2414,24 @@ app.post('/api/payments/create-checkout', async (req, res) => {
     // Convert USD to CFA (1 USD = 600 CFA) - Enforce progressive pricing for dossiers
     let amountCFA = Math.round((amountUSD || 2.5) * 600);
     if (!isSubscription && dossierId) {
-      const dossier = db.dossiers.find(d => d.id === dossierId);
-      if (dossier) {
-        const cost = getDossierCost(dossier);
-        amountCFA = cost.cfa;
+      if (dossierId.startsWith('draft_')) {
+        const draft = db.draftDossiers?.find(d => d.id === dossierId);
+        if (draft) {
+          const estimatedPages = draft.estimatedPages;
+          if (estimatedPages < 15) {
+            amountCFA = 1500;
+          } else if (estimatedPages <= 50) {
+            amountCFA = 5000;
+          } else {
+            amountCFA = 10000;
+          }
+        }
+      } else {
+        const dossier = db.dossiers.find(d => d.id === dossierId);
+        if (dossier) {
+          const cost = getDossierCost(dossier);
+          amountCFA = cost.cfa;
+        }
       }
     }
     const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
@@ -2668,33 +2811,89 @@ app.get('/api/payments/callback', async (req, res) => {
         );
       } else if (dossierId) {
         const targetDossierId = dossierId as string;
-        
-        if (db.user && db.user.id === targetUserId) {
-          if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
-          if (!db.user.unlockedDossiers.includes(targetDossierId)) {
-            db.user.unlockedDossiers.push(targetDossierId);
-          }
-        }
-        
-        const foundUser = db.users.find(u => u.id === targetUserId);
-        if (foundUser) {
-          if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
-          if (!foundUser.unlockedDossiers.includes(targetDossierId)) {
-            foundUser.unlockedDossiers.push(targetDossierId);
-          }
-        }
+        let finalDossierId = targetDossierId;
+        let successMessage = 'Paiement de démonstration validé avec succès !';
+        let costUSD = 2.5;
+        let costCFA = 1500;
 
-        const dossier = db.dossiers.find(d => d.id === targetDossierId);
-        const cost = getDossierCost(dossier);
+        if (targetDossierId.startsWith('draft_')) {
+          const draft = db.draftDossiers?.find(d => d.id === targetDossierId);
+          if (draft) {
+            try {
+              const generatedDossier = await executePhysicalDossierGeneration(
+                targetUserId,
+                draft.offerId,
+                draft.coverPageOptions,
+                draft.mappings,
+                draft.signatureOptions,
+                draft.manualTitle,
+                draft.manualOrganizer
+              );
+              finalDossierId = generatedDossier.id;
+              successMessage = 'Votre dossier premium a été généré et déverrouillé avec succès !';
+              
+              if (generatedDossier.pageCount < 15) {
+                costCFA = 1500; costUSD = 2.5;
+              } else if (generatedDossier.pageCount <= 50) {
+                costCFA = 5000; costUSD = 8.33;
+              } else {
+                costCFA = 10000; costUSD = 16.67;
+              }
+
+              if (db.user && db.user.id === targetUserId) {
+                if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+                if (!db.user.unlockedDossiers.includes(finalDossierId)) {
+                  db.user.unlockedDossiers.push(finalDossierId);
+                }
+              }
+              const foundUser = db.users.find(u => u.id === targetUserId);
+              if (foundUser) {
+                if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+                if (!foundUser.unlockedDossiers.includes(finalDossierId)) {
+                  foundUser.unlockedDossiers.push(finalDossierId);
+                }
+              }
+              db.draftDossiers = db.draftDossiers?.filter(d => d.id !== targetDossierId) || [];
+            } catch (err: any) {
+              console.error('Error compiling draft on mock payment callback:', err);
+              return res.redirect('/?payment_status=failed&message=' + encodeURIComponent('Erreur lors de la génération physique du dossier après paiement: ' + err.message));
+            }
+          }
+        } else {
+          if (db.user && db.user.id === targetUserId) {
+            if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+            if (!db.user.unlockedDossiers.includes(targetDossierId)) {
+              db.user.unlockedDossiers.push(targetDossierId);
+            }
+          }
+          
+          const foundUser = db.users.find(u => u.id === targetUserId);
+          if (foundUser) {
+            if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+            if (!foundUser.unlockedDossiers.includes(targetDossierId)) {
+              foundUser.unlockedDossiers.push(targetDossierId);
+            }
+          }
+
+          const dossier = db.dossiers.find(d => d.id === targetDossierId);
+          if (dossier) {
+            const cost = getDossierCost(dossier);
+            costUSD = cost.usd;
+            costCFA = cost.cfa;
+          }
+        }
 
         logActivity(
           targetUserId,
           db.user?.email || 'user@example.com',
           'UPGRADE',
-          `[SIMULATION] Déverrouillage individuel du dossier ${targetDossierId} via FedaPay API (${cost.usd} USD / ${cost.cfa} FCFA) - Trans ID: ${transactionId}`,
+          `[SIMULATION] Déverrouillage individuel du dossier ${finalDossierId} via FedaPay API (${costUSD} USD / ${costCFA} FCFA) - Trans ID: ${transactionId}`,
           db.user?.country || 'Sénégal',
-          cost.usd
+          costUSD
         );
+        
+        saveDB(db);
+        return res.redirect(`/?payment_status=success&generated_dossier_id=${finalDossierId}&message=` + encodeURIComponent(successMessage));
       }
       
       saveDB(db);
@@ -2745,33 +2944,89 @@ app.get('/api/payments/callback', async (req, res) => {
         );
       } else if (dossierId) {
         const targetDossierId = dossierId as string;
-        
-        if (db.user && db.user.id === targetUserId) {
-          if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
-          if (!db.user.unlockedDossiers.includes(targetDossierId)) {
-            db.user.unlockedDossiers.push(targetDossierId);
-          }
-        }
-        
-        const foundUser = db.users.find(u => u.id === targetUserId);
-        if (foundUser) {
-          if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
-          if (!foundUser.unlockedDossiers.includes(targetDossierId)) {
-            foundUser.unlockedDossiers.push(targetDossierId);
-          }
-        }
+        let finalDossierId = targetDossierId;
+        let successMessage = 'Votre paiement a été validé avec succès !';
+        let costUSD = 2.5;
+        let costCFA = 1500;
 
-        const dossier = db.dossiers.find(d => d.id === targetDossierId);
-        const cost = getDossierCost(dossier);
+        if (targetDossierId.startsWith('draft_')) {
+          const draft = db.draftDossiers?.find(d => d.id === targetDossierId);
+          if (draft) {
+            try {
+              const generatedDossier = await executePhysicalDossierGeneration(
+                targetUserId,
+                draft.offerId,
+                draft.coverPageOptions,
+                draft.mappings,
+                draft.signatureOptions,
+                draft.manualTitle,
+                draft.manualOrganizer
+              );
+              finalDossierId = generatedDossier.id;
+              successMessage = 'Votre dossier premium a été généré et déverrouillé avec succès !';
+              
+              if (generatedDossier.pageCount < 15) {
+                costCFA = 1500; costUSD = 2.5;
+              } else if (generatedDossier.pageCount <= 50) {
+                costCFA = 5000; costUSD = 8.33;
+              } else {
+                costCFA = 10000; costUSD = 16.67;
+              }
+
+              if (db.user && db.user.id === targetUserId) {
+                if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+                if (!db.user.unlockedDossiers.includes(finalDossierId)) {
+                  db.user.unlockedDossiers.push(finalDossierId);
+                }
+              }
+              const foundUser = db.users.find(u => u.id === targetUserId);
+              if (foundUser) {
+                if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+                if (!foundUser.unlockedDossiers.includes(finalDossierId)) {
+                  foundUser.unlockedDossiers.push(finalDossierId);
+                }
+              }
+              db.draftDossiers = db.draftDossiers?.filter(d => d.id !== targetDossierId) || [];
+            } catch (err: any) {
+              console.error('Error compiling draft on live payment callback:', err);
+              return res.redirect('/?payment_status=failed&message=' + encodeURIComponent('Erreur lors de la génération physique du dossier après paiement: ' + err.message));
+            }
+          }
+        } else {
+          if (db.user && db.user.id === targetUserId) {
+            if (!db.user.unlockedDossiers) db.user.unlockedDossiers = [];
+            if (!db.user.unlockedDossiers.includes(targetDossierId)) {
+              db.user.unlockedDossiers.push(targetDossierId);
+            }
+          }
+          
+          const foundUser = db.users.find(u => u.id === targetUserId);
+          if (foundUser) {
+            if (!foundUser.unlockedDossiers) foundUser.unlockedDossiers = [];
+            if (!foundUser.unlockedDossiers.includes(targetDossierId)) {
+              foundUser.unlockedDossiers.push(targetDossierId);
+            }
+          }
+
+          const dossier = db.dossiers.find(d => d.id === targetDossierId);
+          if (dossier) {
+            const cost = getDossierCost(dossier);
+            costUSD = cost.usd;
+            costCFA = cost.cfa;
+          }
+        }
 
         logActivity(
           targetUserId,
           db.user?.email || 'user@example.com',
           'UPGRADE',
-          `Déverrouillage individuel du dossier ${targetDossierId} via FedaPay API (${cost.usd} USD / ${cost.cfa} FCFA) - Trans ID: ${transactionId}`,
+          `Déverrouillage individuel du dossier ${finalDossierId} via FedaPay API (${costUSD} USD / ${costCFA} FCFA) - Trans ID: ${transactionId}`,
           db.user?.country || 'Sénégal',
-          cost.usd
+          costUSD
         );
+        
+        saveDB(db);
+        return res.redirect(`/?payment_status=success&generated_dossier_id=${finalDossierId}&message=` + encodeURIComponent(successMessage));
       }
       
       saveDB(db);
@@ -2805,18 +3060,32 @@ app.get('/api/dossiers/download/:id', (req, res) => {
     isAllowed = true;
   } else if (user?.unlockedDossiers?.includes(dossierId)) {
     isAllowed = true;
-  } else if ((user?.downloadedDossiers?.length || 0) < 3) {
-    // Consume one of the 3 free demo PDF downloads automatically
+  } else if (dossier.isManual || dossier.offerId === 'manual' || dossier.organizer === 'Candidature Spontanée / Libre') {
+    // Free manual dossiers are always allowed for download without consumption or payment
     isAllowed = true;
-    if (user) {
-      if (!user.downloadedDossiers) user.downloadedDossiers = [];
-      user.downloadedDossiers.push(dossierId);
-      const foundUser = db.users.find(u => u.id === user.id);
-      if (foundUser) {
-        if (!foundUser.downloadedDossiers) foundUser.downloadedDossiers = [];
-        foundUser.downloadedDossiers.push(dossierId);
+  } else {
+    // Premium dossiers consume one of the 3 free trial downloads
+    const downloadedPremiumCount = user?.downloadedDossiers?.filter(id => {
+      const d = db.dossiers.find(x => x.id === id);
+      return d && d.offerId !== 'manual';
+    }).length || 0;
+
+    if (downloadedPremiumCount < 3) {
+      isAllowed = true;
+      if (user) {
+        if (!user.downloadedDossiers) user.downloadedDossiers = [];
+        if (!user.downloadedDossiers.includes(dossierId)) {
+          user.downloadedDossiers.push(dossierId);
+        }
+        const foundUser = db.users.find(u => u.id === user.id);
+        if (foundUser) {
+          if (!foundUser.downloadedDossiers) foundUser.downloadedDossiers = [];
+          if (!foundUser.downloadedDossiers.includes(dossierId)) {
+            foundUser.downloadedDossiers.push(dossierId);
+          }
+        }
+        saveDB(db);
       }
-      saveDB(db);
     }
   }
 
